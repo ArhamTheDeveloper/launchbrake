@@ -44,6 +44,18 @@ appblock shims               refresh shims after a package upgrade moved binarie
 intercept hand-typed absolute paths, raw dock commands, or `flatpak run` —
 and says so instead of pretending otherwise.
 
+## Matching scope (structural boundaries, not bugs)
+
+- **Reconcile matches autostart entries by binary *basename*.** An update
+  that *renames* the binary (e.g. `spotify` → `spotify_1.2`) is out of
+  scope: the block's menu-enforcement still holds, but autostart
+  drift-repair won't match the renamed entry. Same category as the dock /
+  absolute-path caveats above — re-block the app under its new name.
+- **`enforced` means the four launch styles in the table below are
+  intercepted *as of the last `list`*.** It is re-verified live on every
+  `list`; a binary that since moved is reported honestly rather than
+  silently left looking enforced.
+
 ## Verified launch coverage (Omarchy/Hyprland, live)
 
 | launch style | result |

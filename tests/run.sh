@@ -94,11 +94,24 @@ section "structural guard (no management from within a shim)"
 cp "$AB" "$HOME/.local/share/appblock/shims/appblock-stale"
 if sh "$HOME/.local/share/appblock/shims/appblock-stale" shims 2>&1 \
      | grep -q 'may not run from within a shim'; then
-  ok "guard refuses management from within shims dir"
+  ok "guard refuses management from within shims dir (copy intrusion)"
 else
   bad "guard did not fire"
 fi
 rm -f "$HOME/.local/share/appblock/shims/appblock-stale"
+# A SYMLINK into the shims dir is NOT an intrusion — it is the designed entry
+# point (shims/appblock -> real script). The guard resolves symlinks
+# (readlink -f) so it must stay silent here: one body of code, no divergence.
+# 'shims' exercises install_shim for every managed app — the guard's real path.
+ln -s "$AB" "$HOME/.local/share/appblock/shims/appblock-alias"
+if PATH="$HOME/.local/share/appblock/shims:$HOME/bin2:$PATH" \
+     "$HOME/.local/share/appblock/shims/appblock-alias" shims 2>&1 \
+     | grep -q 'may not run from within a shim'; then
+  bad "symlink entry point false-positived the guard"
+else
+  ok "symlink entry point works, guard silent (no false positive)"
+fi
+rm -f "$HOME/.local/share/appblock/shims/appblock-alias"
 # ...but the normal PATH entry point through the shims symlink still works
 "$AB" block demoapp >/dev/null 2>&1 || true
 PATH="$HOME/.local/share/appblock/shims:$HOME/bin2:$PATH"
