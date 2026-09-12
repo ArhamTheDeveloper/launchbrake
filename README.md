@@ -29,6 +29,12 @@ want to uninstall things.
 5. **Name resolution** — `appblock block chatgpt` works: names are matched
    case-insensitively against desktop ids, `Name=` fields, and entry URLs.
    An ambiguous match is reported, never guessed.
+6. **Web-app URL guard** — omarchy web-app keybinds (`SUPER SHIFT X` → `X`,
+   YouTube, ChatGPT, …) don't read a `.desktop` entry at all: Hyprland runs
+   `omarchy-launch-webapp <url>`, which picks the browser itself. So while any
+   web-app URL is blocked, appblock also owns that launcher **name on PATH**
+   and refuses the matching URL(s); with nothing blocked the shim is removed
+   and the real launcher runs untouched (no permanent indirection).
 
 ## Install
 
@@ -40,9 +46,9 @@ install -Dm755 bin/appblock ~/.local/share/appblock/appblock
 ## Usage
 
 ```
-appblock block <app>...      block (terminal + launcher + systemd + keybind)
-appblock unblock <app>...    unblock
-appblock toggle <app>...     flip state
+appblock block <app|url>...  block (terminal + launcher + keybind + systemd)
+appblock unblock <app|url>... unblock
+appblock toggle <app|url>... flip state
 appblock list                show blocked apps with honest enforcement labels
 appblock install             (re)wire PATH into every launch path
 appblock shims               refresh shims after a package upgrade moved binaries
@@ -51,21 +57,32 @@ appblock shims               refresh shims after a package upgrade moved binarie
 `list` distinguishes `enforced (launch blocked)` from
 `hidden only — NOT launch-enforced` — a PATH-shim architecture cannot
 intercept hand-typed absolute paths, raw dock commands, or `flatpak run` —
-and says so instead of pretending otherwise. Web-apps/PWAs (no binary to
-shim) are labelled `hidden only (menu entry hidden; direct launch NOT
-intercepted)`.
+and says so instead of pretending otherwise. Web-apps/PWAs are labelled per
+what is actually covered: `menu hidden + omarchy-launch-webapp guard (keybind
+intercepted)`, or plain `hidden only (…)` when no URL is known.
 
 ## Web-apps / PWAs
 
+Works for both shapes: omarchy web-apps (`omarchy-launch-webapp`) and
+Chromium PWAs (`chrome-chatgpt-abc123.desktop`).
+
 ```sh
-appblock block chatgpt      # → resolves to ~/.local/share/applications/ChatGPT.desktop
-appblock list               # 🚫 ChatGPT — hidden only (menu entry hidden; …)
-appblock unblock chatgpt    # → byte-identical restore, verified with cmp
+appblock block x            # resolves to ~/.local/share/applications/X.desktop
+                            # → menu entry renamed aside AND https://x.com/* guarded
+appblock list               # 🚫 X — menu hidden + omarchy-launch-webapp guard
+appblock unblock x          # byte-identical restore, verified with cmp
+
+appblock block https://youtube.com/   # no desktop entry needed at all
 ```
 
-**Structural boundary:** the menu entry is the only hook that exists —
-launching the *same URL through the browser directly* is not intercepted.
-For a hard guarantee, block the browser too (`appblock block chromium`).
+- **URL matching covers the URL and everything under it**, case-insensitively:
+  blocking `https://x.com/` also refuses `https://x.com/compose/post` (so
+  `SUPER SHIFT X` *and* `SUPER SHIFT ALT X` are both caught). Blocking or
+  launching is *never* guessed: a URL is only refused when it equals a blocked
+  URL or sits below it.
+- **Honest boundary:** *typing* the URL into the browser's address bar, or a
+  keybind that calls the browser binary directly (`chromium --app=<url>`), is
+  out of reach — block the browser for that (`appblock block chromium`).
 
 ## Matching scope (structural boundaries, not bugs)
 
@@ -78,8 +95,11 @@ For a hard guarantee, block the browser too (`appblock block chromium`).
   intercepted *as of the last `list`*.** It is re-verified live on every
   `list`; a binary that since moved is reported honestly rather than
   silently left looking enforced.
-- **Web-app/PWA blocks are menu-level only** (see boundary note above);
-  the browser itself reaching the URL is out of reach by design.
+- **Web-app URL guard owns `omarchy-launch-webapp` on PATH only while a URL
+  is blocked** — the shim is created and deleted automatically, self-heals if
+  removed (`reconcile`), and is deliberately *not* registered as a managed
+  app (so `appblock shims` can't turn it into an everything-blocker). It
+  falls through to the real launcher for every other invocation.
 
 ## Verified launch coverage (Omarchy/Hyprland, live)
 
@@ -89,6 +109,8 @@ For a hard guarantee, block the browser too (`appblock block chromium`).
 | compositor/keybind | shim intercepts (hl.env PATH wiring) |
 | `systemd-run --user` / user services | shim intercepts (environment.d) |
 | menu/launcher (GLib GAppInfo) | hidden + shim intercepts even on forced launch |
+| web-app keybind (`omarchy-launch-webapp`) | URL guard intercepts (verified live: `SUPER SHIFT X` + compose binding) |
+| web-app keybind via `omarchy-launch-or-focus-webapp` | same guard intercepts (inner `eval exec` resolves through PATH) |
 
 ## Tests
 

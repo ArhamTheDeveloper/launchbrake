@@ -36,6 +36,9 @@ touch "$HOME/.bashrc" "$HOME/.zshrc"
 printf '#!/bin/sh\necho hi-from-demoapp\n' >"$HOME/bin/demoapp"
 chmod +x "$HOME/bin/demoapp"
 cp "$HOME/bin/demoapp" "$HOME/bin2/demoapp"   # same-basename updated binary (app update)
+# omarchy's web-app keybind launcher (the path SUPER SHIFT X et al. use)
+printf '#!/bin/sh\necho "launched:$1"\n' >"$HOME/bin/omarchy-launch-webapp"
+chmod +x "$HOME/bin/omarchy-launch-webapp"
 # The app's REAL desktop entry: absolute Exec, in a GLib-searched dir (packaged-app shape)
 printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin/demoapp\n' "$HOME" \
   >"$HOME/.local/share/flatpak/exports/share/applications/demoapp.desktop"
@@ -101,8 +104,8 @@ check "original PWA entry renamed aside (not clobbered)" \
   test ! -e "$HOME/.local/share/applications/chrome-chatgpt-abc123.desktop"
 check "renamed original preserved on disk" \
   test -f "$HOME/.local/share/applications/.appblock-disabled.chrome-chatgpt-abc123.desktop.off"
-if "$AB" list | grep -q 'chrome-chatgpt-abc123 — hidden only'; then
-  ok "list labels PWA as hidden-only (no PATH binary to enforce)"
+if "$AB" list | grep -q 'chrome-chatgpt-abc123 — menu hidden + omarchy-launch-webapp guard'; then
+  ok "list shows menu-hide + keybind-guard coverage for a PWA URL"
 else
   bad "PWA label wrong"
 fi
@@ -136,6 +139,52 @@ fi
 check_not "nothing blocked on ambiguity" \
   grep -q chatgpt "$HOME/.local/share/appblock/blocked.list"
 rm -f "$HOME/.local/share/applications/another-chatgpt.desktop"
+
+section "web-app URL guard (the keybind path: omarchy-launch-webapp)"
+# omarchy keybinds (e.g. SUPER SHIFT X) run `omarchy-launch-webapp <url>`,
+# which picks the browser itself and never reads a .desktop entry — so the
+# guard has to own the launcher name on PATH.
+printf '[Desktop Entry]\nType=Application\nName=X\nExec=omarchy-launch-webapp https://x.com/\n' \
+  >"$HOME/.local/share/applications/X.desktop"
+"$AB" block x >/dev/null 2>&1
+check "guard shim installed while a web-app is blocked" \
+  test -x "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
+if omarchy-launch-webapp "https://x.com/" 2>&1 | grep -q blocked; then
+  ok "blocked web-app URL is refused on the keybind path"
+else
+  bad "keybind URL still launches while blocked"
+fi
+if omarchy-launch-webapp "https://x.com/compose/post" 2>&1 | grep -q blocked; then
+  ok "paths under the blocked URL are refused too (compose binding)"
+else
+  bad "subpath URL bypasses the guard"
+fi
+[ "$(omarchy-launch-webapp "https://example.com/" 2>/dev/null)" = "launched:https://example.com/" ] \
+  && ok "unrelated URL still launches (guard is transparent)" || bad "guard broke unrelated launches"
+"$AB" list | grep -q 'X — menu hidden + omarchy-launch-webapp guard' \
+  && ok "list reports honest keybind coverage" || bad "coverage label missing"
+
+# A URL is blockable with no desktop entry at all (keybind-only web-apps).
+"$AB" block "https://youtube.com/" >/dev/null 2>&1
+if omarchy-launch-webapp "https://youtube.com/watch?v=1" 2>&1 | grep -q blocked; then
+  ok "direct URL block covers keybind-only web-apps (no .desktop entry)"
+else
+  bad "direct URL block did not intercept"
+fi
+"$AB" list | grep -q 'https://youtube.com/ — web-app URL guard' \
+  && ok "URL block listed with its own label" || bad "URL block not listed"
+check_not "guard is NOT registered as a name-blocking managed shim" \
+  grep -q '^omarchy-launch-webapp$' "$HOME/.local/share/appblock/managed.list"
+# drift: guard deleted -> self-heals on the next invocation
+rm -f "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
+"$AB" list >/dev/null 2>&1
+check "guard self-heals after deletion (reconcile)" \
+  test -x "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
+"$AB" unblock "https://youtube.com/" x >/dev/null 2>&1
+check "guard removed once the last URL block is lifted" \
+  test ! -e "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
+[ "$(omarchy-launch-webapp "https://x.com/" 2>/dev/null)" = "launched:https://x.com/" ] \
+  && ok "launcher runs untouched again (no permanent indirection)" || bad "stale guard left behind"
 
 section "moved binary -> shim dropped, menu-level block survives"
 "$AB" block demoapp >/dev/null 2>&1   # re-block against $HOME/bin/demoapp (still present)

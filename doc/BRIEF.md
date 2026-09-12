@@ -33,9 +33,12 @@ All three launch styles **verified live on Omarchy/Hyprland**: compositor-spawne
 - **Fuzzy name resolution**: `appblock block chatgpt` → `ChatGPT.desktop` (case-insensitive id / `Name=` / URL match); ambiguity is reported, never guessed; entries renamed aside stay resolvable so unblock works while blocked.
 
 ## Web-apps / PWAs — CLOSED (verified live, omarchy web-apps)
-- `appblock block chatgpt` → `ChatGPT` hidden via rename; **GLib `GAppInfo` confirms the entry vanishes from menus** while blocked; `unblock` restores the file **byte-identical** (verified with `cmp` + sha256).
-- `reconcile()` re-renames a PWA entry that an app reinstall brought back (drift repair, tested).
-- **Structural boundary (documented, not a bug):** blocking a web-app cannot stop the *browser* from opening the same URL directly — the desktop entry is the only hook. For a hard guarantee, block the browser too.
+- `appblock block chatgpt` / `block x` → menu entry **renamed aside**; **GLib `GAppInfo` confirms it vanishes from menus**; `unblock` restores the file **byte-identical** (verified with `cmp` + sha256).
+- **Keybind path closed**: omarchy's web-app keybinds (`SUPER SHIFT X` → `omarchy-launch-webapp https://x.com/`) never read a `.desktop` entry — Hyprland calls the launcher, which resolves the browser binary itself. Interception point: that launcher name on **PATH**. While any URL is blocked, appblock writes a URL-guard shim (`$SHIMS/omarchy-launch-webapp`) that refuses blocked URLs (URL itself **and everything under it**) and `exec`s the real launcher otherwise; it is deleted as soon as the last URL block is lifted, so there's never a permanent indirection. `omarchy-launch-or-focus-webapp` is covered too (its `eval exec setsid $CMDLINE` resolves through PATH).
+- **URLs are first-class targets**: `appblock block https://youtube.com/` needs no desktop entry (covers keybind-only web-apps such as YouTube/Grok).
+- Verified live: `SUPER SHIFT X` command → exit 1, browser never starts; compose sub-binding `https://x.com/compose/post` → exit 1; `omarchy-launch-or-focus-webapp` path → refused.
+- `reconcile()` re-renames a reinstalled PWA entry and recreates a deleted guard shim (drift repair, both tested).
+- **Remaining boundary (documented, not a bug):** typing the URL into the browser's address bar, or a keybind calling the browser binary directly (`chromium --app=<url>`), is not intercepted — block the browser for a hard guarantee.
 
 ## Known gap
 - GUI apps launched by the desktop session use the **session PATH**, not the shell's — so the launcher-hidden layer works, but direct binary launch isn't shimmed for GUI apps yet.
