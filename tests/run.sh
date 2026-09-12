@@ -18,6 +18,10 @@ check() { # check <msg> <cmd...> — runs cmd, drops msg from the arg list
   msg=$1; shift
   if "$@" >/dev/null 2>&1; then ok "$msg"; else bad "$msg"; fi
 }
+check_not() { # check_not <msg> <cmd...> — negated check
+  msg=$1; shift
+  if "$@" >/dev/null 2>&1; then bad "$msg"; else ok "$msg"; fi
+}
 
 sh -n "$AB" && ok "syntax check" || bad "syntax check"
 
@@ -81,10 +85,64 @@ check "reconcile re-disabled autostart after clobber" \
 grep -q 'bin2/demoapp --new-flag' "$HOME/.config/autostart/demoapp.desktop" \
   && ok "unblock MERGED (kept app-updated Exec)" || bad "unblock reverted app-updated Exec"
 
-section "moved binary -> loud skip + stale shim removal"
+section "web-app / PWA (user-dir entries, rename flow)"
+# Chromium-style PWA: real entry lives in ~/.local/share/applications
+printf '[Desktop Entry]\nType=Application\nName=ChatGPT\nExec=/usr/bin/chromium --profile-directory=Default --app=https://chatgpt.com/\n' \
+  >"$HOME/.local/share/applications/chrome-chatgpt-abc123.desktop"
+# omarchy-style web-app
+printf '[Desktop Entry]\nType=Application\nName=Figma\nExec=omarchy-launch-webapp https://figma.com/\n' \
+  >"$HOME/.local/share/applications/Figma.desktop"
+
+"$AB" block chatgpt >/dev/null 2>&1 && ok "block web-app by lowercase name (fuzzy → chrome-chatgpt-abc123)" \
+  || bad "fuzzy name resolution failed"
+check "canonical id in blocklist" \
+  grep -qxF chrome-chatgpt-abc123 "$HOME/.local/share/appblock/blocked.list"
+check "original PWA entry renamed aside (not clobbered)" \
+  test ! -e "$HOME/.local/share/applications/chrome-chatgpt-abc123.desktop"
+check "renamed original preserved on disk" \
+  test -f "$HOME/.local/share/applications/.appblock-disabled.chrome-chatgpt-abc123.desktop.off"
+if "$AB" list | grep -q 'chrome-chatgpt-abc123 — hidden only'; then
+  ok "list labels PWA as hidden-only (no PATH binary to enforce)"
+else
+  bad "PWA label wrong"
+fi
+"$AB" unblock chatgpt >/dev/null 2>&1
+check "restore is byte-exact (original Exec back)" \
+  grep -q -- '--app=https://chatgpt.com/' "$HOME/.local/share/applications/chrome-chatgpt-abc123.desktop"
+check "no disabled file left after restore" \
+  test ! -e "$HOME/.local/share/applications/.appblock-disabled.chrome-chatgpt-abc123.desktop.off"
+
+section "PWA reinstall drift repair"
+"$AB" block figma >/dev/null 2>&1
+check "omarchy web-app Figma blocked via name→id (Figma)" \
+  grep -qxF Figma "$HOME/.local/share/appblock/blocked.list"
+# simulate Chrome/omarchy re-adding the entry after a reinstall
+printf '[Desktop Entry]\nType=Application\nName=Figma\nExec=omarchy-launch-webapp https://figma.com/\n' \
+  >"$HOME/.local/share/applications/Figma.desktop"
+"$AB" list >/dev/null 2>&1
+check "reinstall drift: reconcile re-renames the fresh entry" \
+  test ! -e "$HOME/.local/share/applications/Figma.desktop"
+"$AB" unblock figma >/dev/null 2>&1
+
+section "ambiguous fuzzy name is rejected, not guessed"
+# second entry whose Name= collides with ChatGPT's
+printf '[Desktop Entry]\nType=Application\nName=ChatGPT\nExec=/usr/bin/other-chromium --app=https://chatgpt.dev/\n' \
+  >"$HOME/.local/share/applications/another-chatgpt.desktop"
+if "$AB" block chatgpt 2>&1 | grep -q "ambiguous"; then
+  ok "ambiguity reported loudly"
+else
+  bad "ambiguous name did not produce an error"
+fi
+check_not "nothing blocked on ambiguity" \
+  grep -q chatgpt "$HOME/.local/share/appblock/blocked.list"
+rm -f "$HOME/.local/share/applications/another-chatgpt.desktop"
+
+section "moved binary -> shim dropped, menu-level block survives"
 "$AB" block demoapp >/dev/null 2>&1   # re-block against $HOME/bin/demoapp (still present)
 mv "$HOME/bin/demoapp" "$HOME/bin2/demoapp"
-"$AB" block demoapp 2>&1 | grep -q 'not found on PATH' && ok "loud skip on moved binary" || bad "no loud skip"
+"$AB" block demoapp 2>&1 | grep -q 'menu/autostart-level only' \
+  && ok "honest note: menu-level only (binary moved, desktop entry remains)" \
+  || bad "no honest menu-level note"
 check "stale shim removed" test ! -f "$HOME/.local/share/appblock/shims/demoapp"
 
 section "structural guard (no management from within a shim)"

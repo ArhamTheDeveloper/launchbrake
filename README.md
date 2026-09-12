@@ -1,8 +1,9 @@
 # appblock
 
-Block any installed app — GUI or CLI — from launching, with an instant toggle.
-A dependency-free POSIX-sh tool for people who get distracted by their own
-computer (music players, games, chat apps) and don't want to uninstall things.
+Block any installed app — GUI, CLI, or **web-app/PWA** — from launching, with
+an instant toggle. A dependency-free POSIX-sh tool for people who get
+distracted by their own computer (music players, games, chat apps) and don't
+want to uninstall things.
 
 ## How it works
 
@@ -13,13 +14,21 @@ computer (music players, games, chat apps) and don't want to uninstall things.
 2. **Menu hiding** — blocked apps get a `NoDisplay=true` desktop-entry
    override, which also masks any absolute `Exec=` in the original entry
    (per Base Directory Spec, `$XDG_DATA_HOME` wins).
+   **Web-apps/PWAs** (entries living in `~/.local/share/applications`, e.g.
+   Chromium PWAs or omarchy `omarchy-launch-webapp` apps) are instead
+   **renamed aside** to `.appblock-disabled.<id>.desktop.off` — byte-exact
+   and reversible on unblock, and invisible to GLib/menus while blocked.
 3. **Autostart discipline** — blocked apps' `~/.config/autostart` entries
    get `Hidden=true`; `reconcile()` re-applies on every invocation so app
-   updates can't silently clobber the block. Unblock merges (only clears
+   updates can't silently clobber the block (this also re-renames a PWA
+   entry that an update/reinstall brought back). Unblock merges (only clears
    `Hidden`, never reverts an updated `Exec=`).
 4. **State** — plaintext files (`blocked.list`, `managed.list`), read fresh
    each run. Toggling is instant. Real binaries and packages are untouched,
    so the tool survives system updates.
+5. **Name resolution** — `appblock block chatgpt` works: names are matched
+   case-insensitively against desktop ids, `Name=` fields, and entry URLs.
+   An ambiguous match is reported, never guessed.
 
 ## Install
 
@@ -42,7 +51,21 @@ appblock shims               refresh shims after a package upgrade moved binarie
 `list` distinguishes `enforced (launch blocked)` from
 `hidden only — NOT launch-enforced` — a PATH-shim architecture cannot
 intercept hand-typed absolute paths, raw dock commands, or `flatpak run` —
-and says so instead of pretending otherwise.
+and says so instead of pretending otherwise. Web-apps/PWAs (no binary to
+shim) are labelled `hidden only (menu entry hidden; direct launch NOT
+intercepted)`.
+
+## Web-apps / PWAs
+
+```sh
+appblock block chatgpt      # → resolves to ~/.local/share/applications/ChatGPT.desktop
+appblock list               # 🚫 ChatGPT — hidden only (menu entry hidden; …)
+appblock unblock chatgpt    # → byte-identical restore, verified with cmp
+```
+
+**Structural boundary:** the menu entry is the only hook that exists —
+launching the *same URL through the browser directly* is not intercepted.
+For a hard guarantee, block the browser too (`appblock block chromium`).
 
 ## Matching scope (structural boundaries, not bugs)
 
@@ -55,6 +78,8 @@ and says so instead of pretending otherwise.
   intercepted *as of the last `list`*.** It is re-verified live on every
   `list`; a binary that since moved is reported honestly rather than
   silently left looking enforced.
+- **Web-app/PWA blocks are menu-level only** (see boundary note above);
+  the browser itself reaching the URL is out of reach by design.
 
 ## Verified launch coverage (Omarchy/Hyprland, live)
 

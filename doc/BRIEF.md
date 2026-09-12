@@ -1,14 +1,14 @@
 # appblock — project brief
 
 ## What it is
-`appblock` is a tiny, dependency-free CLI tool for Linux that lets you **block any installed app — GUI or CLI — from launching, with an instant toggle to unblock it**. It exists to fight distraction (music players, games, social apps) without uninstalling or breaking anything.
+`appblock` is a tiny, dependency-free CLI tool for Linux that lets you **block any installed app — GUI, CLI, or web-app/PWA — from launching, with an instant toggle to unblock it**. It exists to fight distraction (music players, games, social apps) without uninstalling or breaking anything.
 
 ## Why it exists
 Every existing solution covers only websites (browser blockers), or is heavyweight/untoggleable (AppArmor/Firejail profiles, GNOME-only session blockers). macOS has proper app blockers; **Linux desktop has a gap**. GitHub searches for Linux desktop app blockers return essentially nothing. appblock fills that gap.
 
 ## How it works (the mechanism)
 1. **PATH shims**: `~/.local/share/appblock/shims/` is prepended to `PATH`. Each managed app gets a ~6-line POSIX shell script there that (a) checks a plaintext blocklist, (b) if blocked → prints a message and exits, (c) if not → `exec`s the real binary with all args, so it's 100% transparent (signals, TTY, stdin all pass through).
-2. **Launcher hiding**: blocked apps also get a `NoDisplay=true` desktop-entry override in `~/.local/share/applications/`, so they vanish from app menus/launchers. Removed on unblock.
+2. **Launcher hiding**: blocked apps also get a `NoDisplay=true` desktop-entry override in `~/.local/share/applications/`, so they vanish from app menus/launchers. Removed on unblock. **Web-apps/PWAs** (entries whose *original* lives in the user dir — Chromium PWAs, omarchy `omarchy-launch-webapp` apps) are instead **renamed aside** to `.appblock-disabled.<id>.desktop.off`: byte-exact, reversible, invisible to GLib (which only scans `*.desktop`). An override would clobber the original there, so rename is the only safe mechanism.
 3. **State**: two plaintext files — `blocked.list` and `managed.list` — read fresh on every invocation, so toggling is instant and there's nothing to install/uninstall. The real binaries, packages, and configs are never touched (survives system updates).
 
 ## Current state (works, on one Arch/Omarchy machine)
@@ -29,7 +29,13 @@ All three launch styles **verified live on Omarchy/Hyprland**: compositor-spawne
 - **Stale-binary**: shims hardcode resolved absolute path; re-`block` re-resolves PATH (shim dir excluded); vanished binary → shim **deleted** + loud skip. Deletion is structurally guarded against launch-time (resolved-`$0` in-shims check) + generated-shim marker.
 - **Autostart**: block sets `Hidden=true` (with backup), `reconcile()` self-heals app-update clobbering on every invocation, unblock **merges** — only clears `Hidden`, never reverts a changed `Exec=`.
 - **PATH-less apps** (Flatpak/tray/autostart-only) are blockable at the menu/autostart layer via `surface_found()`.
-- **Honest labels**: `list` shows `enforced (launch blocked)` vs `hidden only — NOT launch-enforced`, re-verified at list-time (no caching).
+- **Honest labels**: `list` shows `enforced (launch blocked)` vs `hidden only — NOT launch-enforced`, re-verified at list-time (no caching); web-apps/PWAs show `hidden only (menu entry hidden; direct launch NOT intercepted)`.
+- **Fuzzy name resolution**: `appblock block chatgpt` → `ChatGPT.desktop` (case-insensitive id / `Name=` / URL match); ambiguity is reported, never guessed; entries renamed aside stay resolvable so unblock works while blocked.
+
+## Web-apps / PWAs — CLOSED (verified live, omarchy web-apps)
+- `appblock block chatgpt` → `ChatGPT` hidden via rename; **GLib `GAppInfo` confirms the entry vanishes from menus** while blocked; `unblock` restores the file **byte-identical** (verified with `cmp` + sha256).
+- `reconcile()` re-renames a PWA entry that an app reinstall brought back (drift repair, tested).
+- **Structural boundary (documented, not a bug):** blocking a web-app cannot stop the *browser* from opening the same URL directly — the desktop entry is the only hook. For a hard guarantee, block the browser too.
 
 ## Known gap
 - GUI apps launched by the desktop session use the **session PATH**, not the shell's — so the launcher-hidden layer works, but direct binary launch isn't shimmed for GUI apps yet.
