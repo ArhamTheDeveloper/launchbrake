@@ -8,12 +8,13 @@ Every existing solution covers only websites (browser blockers), or is heavyweig
 
 ## How it works (the mechanism)
 1. **PATH shims**: `~/.local/share/appblock/shims/` is prepended to `PATH`. Each managed app gets a ~6-line POSIX shell script there that (a) checks a plaintext blocklist, (b) if blocked → prints a message and exits, (c) if not → `exec`s the real binary with all args, so it's 100% transparent (signals, TTY, stdin all pass through).
-2. **Launcher hiding**: blocked apps also get a `NoDisplay=true` desktop-entry override in `~/.local/share/applications/`, so they vanish from app menus/launchers. Removed on unblock. **Web-apps/PWAs** (entries whose *original* lives in the user dir — Chromium PWAs, omarchy `omarchy-launch-webapp` apps) are instead **renamed aside** to `.appblock-disabled.<id>.desktop.off`: byte-exact, reversible, invisible to GLib (which only scans `*.desktop`). An override would clobber the original there, so rename is the only safe mechanism.
+2. **Launcher hiding**: blocked apps also get a `NoDisplay=true` desktop-entry override in `~/.local/share/applications/`, so they vanish from app menus/launchers. Removed on unblock. **Web-apps/PWAs** (entries whose *original* lives in the user dir — Chromium PWAs, omarchy `omarchy-launch-webapp` apps) are instead **renamed aside** to `.appblock-disabled.<id>.desktop.off`: byte-exact, reversible, invisible to GLib (which only scans `*.desktop`). An override would clobber the original there, so rename is the only safe mechanism. **Desktop icons** (DING/xfdesktop-style views that show launcher *files*) are a separate namespace — matched by `Exec` contents in the XDG desktop dir and renamed aside the same way (see below).
 3. **State**: two plaintext files — `blocked.list` and `managed.list` — read fresh on every invocation, so toggling is instant and there's nothing to install/uninstall. The real binaries, packages, and configs are never touched (survives system updates).
 
 ## Current state (works, on one Arch/Omarchy machine)
-- Commands: `appblock block|unblock|toggle <app...>`, `list`, `install`, `shims`
+- Commands: `appblock block|unblock|toggle <app|url...>`, `list`, `install`, `shims`
 - Blocking verified end-to-end for CLI apps (`rmpc`) and launcher visibility
+- Desktop-icon hiding on icon-showing DEs, with omarchy's `$HOME`-as-desktop caveat handled (see below)
 - PATH wiring into all **three** launch paths (see below) — GUI-app gap CLOSED
 - Written in POSIX sh, zero dependencies
 
@@ -39,6 +40,14 @@ All three launch styles **verified live on Omarchy/Hyprland**: compositor-spawne
 - Verified live: `SUPER SHIFT X` command → exit 1, browser never starts; compose sub-binding `https://x.com/compose/post` → exit 1; `omarchy-launch-or-focus-webapp` path → refused.
 - `reconcile()` re-renames a reinstalled PWA entry and recreates a deleted guard shim (drift repair, both tested).
 - **Remaining boundary (documented, not a bug):** typing the URL into the browser's address bar, or a keybind calling the browser binary directly (`chromium --app=<url>`), is not intercepted — block the browser for a hard guarantee.
+
+## Desktop icons — CLOSED (verified live)
+- A desktop view (GNOME DING, KDE Folder View, xfdesktop, Nemo, pcmanfm-qt) is a namespace of its own: it shows launcher *files* and launches `Exec=` **by path** — menu keys (`NoDisplay`/`Hidden`) are irrelevant there and an absolute Exec bypasses PATH. The PWA rename-aside trick is therefore applied to this namespace too.
+- Desktop dir resolved per XDG: `xdg-user-dir DESKTOP` → `XDG_DESKTOP_DIR` from `user-dirs.dirs` → `~/Desktop`; absent dir → graceful no-op (the Hyprland shape).
+- **omarchy caveat (the machine this was built on): `XDG_DESKTOP_DIR="$HOME/"`** — the desktop folder *is* the home directory. Matching is therefore surgical: only top-level `*.desktop` files whose `Exec` names the blocked binary (any whitespace-separated token, quotes stripped — `env "WINEPREFIX=…" wine "…lnk"` matches `wine`) or opens a blocked URL are renamed aside; nothing else in `$HOME` is ever touched.
+- URL coupling: an icon whose Exec is `omarchy-launch-webapp https://x.com/` hides when `x` *or* the URL is blocked; subpath coverage follows the same rule as the guard (`url_covered`).
+- Drift repair: `reconcile()` re-hides an icon recreated while blocked.
+- Verified live on the omarchy machine: probe icon for a throwaway URL → hidden on block, guard refused exact + subpath URLs (exit 1, browser never started), the four real `$HOME/*.desktop` game launchers (Cuphead, CoD ×2, steam) checksum-identical throughout, restore byte-identical (`cmp`), no aside residue, guard shim removed when the last URL block lifted. Sandbox suite: 62/62 (was 44).
 
 ## Known gap
 - GUI apps launched by the desktop session use the **session PATH**, not the shell's — so the launcher-hidden layer works, but direct binary launch isn't shimmed for GUI apps yet.

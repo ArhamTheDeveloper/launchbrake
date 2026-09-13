@@ -27,6 +27,9 @@ sh -n "$AB" && ok "syntax check" || bad "syntax check"
 
 # ---------- sandbox ----------
 export HOME="$(mktemp -d /tmp/appblock-test.XXXXXX)"
+# xdg-user-dir reads $XDG_CONFIG_HOME (set on Omarchy) — sandbox it too, else
+# the desktop-dir lookup escapes the fake HOME.
+export XDG_CONFIG_HOME="$HOME/.config"
 trap 'rm -rf "$HOME"' EXIT
 mkdir -p "$HOME/bin" "$HOME/bin2" \
          "$HOME/.local/share/applications" \
@@ -185,6 +188,78 @@ check "guard removed once the last URL block is lifted" \
   test ! -e "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
 [ "$(omarchy-launch-webapp "https://x.com/" 2>/dev/null)" = "launched:https://x.com/" ] \
   && ok "launcher runs untouched again (no permanent indirection)" || bad "stale guard left behind"
+
+section "desktop icon hiding (DING / Folder View / xfdesktop / Nemo / pcmanfm-qt)"
+mkdir -p "$HOME/Desktop"
+# what a desktop view really shows: launcher *files*, launched by path
+printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin/demoapp\n' "$HOME" \
+  >"$HOME/Desktop/demoapp-abs.desktop"
+printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=demoapp\n' \
+  >"$HOME/Desktop/demoapp-bare.desktop"
+printf '[Desktop Entry]\nType=Application\nName=X\nExec=omarchy-launch-webapp https://x.com/\n' \
+  >"$HOME/Desktop/X.desktop"
+printf '[Desktop Entry]\nType=Application\nName=unrelated\nExec=false\n' \
+  >"$HOME/Desktop/unrelated.desktop"
+"$AB" block demoapp >/dev/null 2>&1
+check "absolute-Exec desktop icon hidden (path-launch bypass closed)" \
+  test ! -e "$HOME/Desktop/demoapp-abs.desktop"
+check "  ...renamed aside, byte-preserved for restore" \
+  test -f "$HOME/Desktop/.appblock-disabled.demoapp-abs.desktop.off"
+check "bare-Exec desktop icon hidden too" test ! -e "$HOME/Desktop/demoapp-bare.desktop"
+check "unrelated desktop icon untouched" test -f "$HOME/Desktop/unrelated.desktop"
+"$AB" unblock demoapp >/dev/null 2>&1
+check "unblock restores the absolute-Exec icon" test -f "$HOME/Desktop/demoapp-abs.desktop"
+check "unblock restores the bare-Exec icon" test -f "$HOME/Desktop/demoapp-bare.desktop"
+check_not "no disabled icons left behind" \
+  ls "$HOME/Desktop"/.appblock-disabled.demoapp-abs.desktop.off
+
+# Wine/game launcher shape (as found in a real omarchy $HOME):
+#   Exec=env "WINEPREFIX=…" wine "C:\…\Game.lnk"   → first token is `env`
+printf '#!/bin/sh\necho wine\n' >"$HOME/bin/wine"
+chmod +x "$HOME/bin/wine"
+printf '[Desktop Entry]\nType=Application\nName=Cuphead\nExec=env "WINEPREFIX=%s/.wine" wine "C:\\\\games\\\\Cuphead.lnk"\n' "$HOME" \
+  >"$HOME/Desktop/game.desktop"
+"$AB" block wine >/dev/null 2>&1
+check "env-prefixed (Wine) icon hidden — any Exec token matches" \
+  test ! -e "$HOME/Desktop/game.desktop"
+"$AB" unblock wine >/dev/null 2>&1
+check "env-prefixed icon restored" test -f "$HOME/Desktop/game.desktop"
+rm -f "$HOME/Desktop/game.desktop"
+
+"$AB" block x >/dev/null 2>&1
+check "web-app desktop icon hidden (matched by URL)" test ! -e "$HOME/Desktop/X.desktop"
+"$AB" unblock x >/dev/null 2>&1
+check "web-app desktop icon restored" test -f "$HOME/Desktop/X.desktop"
+"$AB" block "https://x.com/" >/dev/null 2>&1
+check "blocking a bare URL hides an icon for that URL" test ! -e "$HOME/Desktop/X.desktop"
+"$AB" unblock "https://x.com/" >/dev/null 2>&1
+check "URL unblock restores it" test -f "$HOME/Desktop/X.desktop"
+
+# drift: an icon recreated while blocked is re-hidden on the next invocation
+"$AB" block x >/dev/null 2>&1
+cp "$HOME/Desktop/.appblock-disabled.X.desktop.off" "$HOME/Desktop/X.desktop"
+"$AB" list >/dev/null 2>&1
+check "icon recreated while blocked is re-hidden (drift repaired)" \
+  test ! -e "$HOME/Desktop/X.desktop"
+"$AB" unblock x >/dev/null 2>&1
+check "no duplicate icons after drift repair + unblock" \
+  test -f "$HOME/Desktop/X.desktop" -a ! -e "$HOME/Desktop/.appblock-disabled.X.desktop.off"
+
+section "desktop dir resolution (XDG user-dirs, not hardcoded ~/Desktop)"
+mkdir -p "$HOME/MyDesk" "$HOME/.config"
+printf 'XDG_DESKTOP_DIR="$HOME/MyDesk"\n' >"$HOME/.config/user-dirs.dirs"
+printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=demoapp\n' \
+  >"$HOME/MyDesk/demoapp.desktop"
+"$AB" block demoapp >/dev/null 2>&1
+check "custom XDG_DESKTOP_DIR honored" test ! -e "$HOME/MyDesk/demoapp.desktop"
+"$AB" unblock demoapp >/dev/null 2>&1
+check "custom-dir icon restored" test -f "$HOME/MyDesk/demoapp.desktop"
+rm -f "$HOME/.config/user-dirs.dirs"
+rm -rf "$HOME/MyDesk"
+rm -rf "$HOME/Desktop"
+"$AB" block demoapp >/dev/null 2>&1 && "$AB" unblock demoapp >/dev/null 2>&1 \
+  && ok "no desktop dir present → graceful no-op (Hyprland shape)" \
+  || bad "errored when no desktop dir exists"
 
 section "moved binary -> shim dropped, menu-level block survives"
 "$AB" block demoapp >/dev/null 2>&1   # re-block against $HOME/bin/demoapp (still present)

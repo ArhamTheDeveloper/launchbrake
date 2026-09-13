@@ -3,7 +3,8 @@
 Block any installed app — GUI, CLI, or **web-app/PWA** — from launching, with
 an instant toggle. A dependency-free POSIX-sh tool for people who get
 distracted by their own computer (music players, games, chat apps) and don't
-want to uninstall things.
+want to uninstall things. Covers every launch surface it can see: PATH,
+app menus, autostart, omarchy web-app keybinds, and desktop icons.
 
 ## How it works
 
@@ -23,13 +24,22 @@ want to uninstall things.
    updates can't silently clobber the block (this also re-renames a PWA
    entry that an update/reinstall brought back). Unblock merges (only clears
    `Hidden`, never reverts an updated `Exec=`).
-4. **State** — plaintext files (`blocked.list`, `managed.list`), read fresh
+4. **Desktop icons** — on DEs whose desktop view shows launcher *files*
+   (GNOME's DING, KDE Folder View, xfdesktop, Nemo, pcmanfm-qt), menu hiding
+   is irrelevant: the icon launches `Exec=` by path. appblock resolves the
+   desktop dir via XDG user-dirs (`xdg-user-dir` → `user-dirs.dirs` →
+   `~/Desktop`) and renames matching icons aside
+   (`.appblock-disabled.<name>.desktop.off`), restored byte-identically on
+   unblock. On omarchy `XDG_DESKTOP_DIR="$HOME/"`, so matching is strictly
+   per-`Exec`: only icons naming the blocked binary (any token, e.g.
+   `env WINEPREFIX=… wine …`) or opening a blocked URL are touched.
+5. **State** — plaintext files (`blocked.list`, `managed.list`), read fresh
    each run. Toggling is instant. Real binaries and packages are untouched,
    so the tool survives system updates.
-5. **Name resolution** — `appblock block chatgpt` works: names are matched
+6. **Name resolution** — `appblock block chatgpt` works: names are matched
    case-insensitively against desktop ids, `Name=` fields, and entry URLs.
    An ambiguous match is reported, never guessed.
-6. **Web-app URL guard** — omarchy web-app keybinds (`SUPER SHIFT X` → `X`,
+7. **Web-app URL guard** — omarchy web-app keybinds (`SUPER SHIFT X` → `X`,
    YouTube, ChatGPT, …) don't read a `.desktop` entry at all: Hyprland runs
    `omarchy-launch-webapp <url>`, which picks the browser itself. So while any
    web-app URL is blocked, appblock also owns that launcher **name on PATH**
@@ -84,6 +94,30 @@ appblock block https://youtube.com/   # no desktop entry needed at all
   keybind that calls the browser binary directly (`chromium --app=<url>`), is
   out of reach — block the browser for that (`appblock block chromium`).
 
+## Desktop icons
+
+A desktop view is a third namespace: it shows launcher *files*, and
+double-clicking runs `Exec=` by path — `NoDisplay`/`Hidden` (menu keys) do
+nothing there, and an absolute Exec bypasses PATH. So when a DE shows desktop
+icons (GNOME DING, KDE Folder View, xfdesktop, Nemo, pcmanfm-qt), appblock
+hides those too:
+
+```sh
+appblock block steam   # → ~/steam.desktop renamed aside, restored on unblock
+appblock block x       # → an icon that runs omarchy-launch-webapp https://x.com/ is hidden too
+appblock block https://youtube.com/   # a bare URL block hides its icon as well
+```
+
+- The desktop dir is resolved per XDG: `xdg-user-dir DESKTOP`, then
+  `XDG_DESKTOP_DIR` from `user-dirs.dirs`, then `~/Desktop`. No dir → no-op.
+- **omarchy sets `XDG_DESKTOP_DIR="$HOME/"`** — the desktop folder *is* your
+  home directory. appblock therefore never sweeps the directory: only
+  top-level `*.desktop` files whose `Exec` names the blocked binary (any
+  token — `env "WINEPREFIX=…" wine "…lnk"` still matches `wine`) or opens the
+  blocked URL are renamed aside. Everything else in `$HOME` is untouched.
+- Same reversible mechanism as PWA entries: byte-identical restore, and
+  `reconcile()` re-hides an icon recreated while blocked.
+
 ## Matching scope (structural boundaries, not bugs)
 
 - **Reconcile matches autostart entries by binary *basename*.** An update
@@ -111,6 +145,7 @@ appblock block https://youtube.com/   # no desktop entry needed at all
 | menu/launcher (GLib GAppInfo) | hidden + shim intercepts even on forced launch |
 | web-app keybind (`omarchy-launch-webapp`) | URL guard intercepts (verified live: `SUPER SHIFT X` + compose binding) |
 | web-app keybind via `omarchy-launch-or-focus-webapp` | same guard intercepts (inner `eval exec` resolves through PATH) |
+| desktop-icon double-click (DING/xfdesktop/…) | icon renamed aside (XDG desktop dir); guarded URL icons also refused |
 
 ## Tests
 

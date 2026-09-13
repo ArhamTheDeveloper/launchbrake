@@ -19,6 +19,25 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 BACKUP_DIR="$BASE/autostart-backup"
 SELF="$SHIMS/appblock"
 
+# Where a desktop view (GNOME DING, KDE Folder View, xfdesktop, Nemo/Caja,
+# pcmanfm-qt) reads launcher files from. Respect XDG user-dirs rather than
+# assuming ~/Desktop — omarchy ships XDG_DESKTOP_DIR="$HOME/", i.e. the home
+# directory itself. May legitimately not exist (Hyprland has no desktop view).
+ICON_DIR=
+if command -v xdg-user-dir >/dev/null 2>&1; then
+  ICON_DIR=$(xdg-user-dir DESKTOP 2>/dev/null) || ICON_DIR=
+fi
+if [ -z "$ICON_DIR" ]; then
+  udf="${XDG_CONFIG_HOME:-$HOME/.config}/user-dirs.dirs"
+  if [ -f "$udf" ]; then
+    ICON_DIR=$(sed -n 's/^XDG_DESKTOP_DIR="\(.*\)"$/\1/p' "$udf" | head -n1) || ICON_DIR=
+    case "$ICON_DIR" in
+      *'$HOME'*) ICON_DIR=$HOME${ICON_DIR#*'$HOME'} ;;
+    esac
+  fi
+fi
+[ -n "$ICON_DIR" ] || ICON_DIR="$HOME/Desktop"
+
 mkdir -p "$SHIMS" "$DESKTOP_DIR"
 touch "$STATE" "$MANAGED" "$WEBAPPS"
 
@@ -280,6 +299,63 @@ refresh_webguard() {
   remove_webguard
 }
 
+# --- desktop icons (a namespace of their own) --------------------------------
+# A desktop view shows *files*, and double-clicking one launches its Exec by
+# path — so NoDisplay/Hidden (menu-listing keys) are irrelevant, and an
+# absolute Exec bypasses PATH too. Same reversible rename trick as user-dir
+# web-apps, matched by what the launcher file actually points at:
+# its Exec basename, or the web-app URL it opens.
+
+# url_covered <url> <blocked-url> — blocked URL and everything under it.
+url_covered() {
+  n=$(normalize_url "$1"); b=$(normalize_url "$2")
+  [ "$n" = "$b" ] && return 0
+  case "$n" in "$b"/*) return 0 ;; esac
+  return 1
+}
+
+# Does launcher file $1 point at blocked id $2?
+icon_matches() {
+  ex=$(sed -n 's/^Exec=//p' "$1" | head -n1)
+  # Scan every token, not just the first: wrappers are the norm (e.g. Wine/game
+  # icons are `Exec=env "WINEPREFIX=…" wine "…lnk"`, whose first token is `env`).
+  for tok in $ex; do
+    tok=${tok#\"}; tok=${tok%\"}; tok=${tok#\'}; tok=${tok%\'}
+    [ "${tok##*/}" = "$2" ] && return 0
+  done
+  u=$(printf '%s' "$ex" | grep -o 'https\?://[^ "]*' | head -n1) || u=
+  [ -n "$u" ] || return 1
+  case "$2" in
+    http://*|https://*) url_covered "$u" "$2" && return 0 ;;
+  esac
+  w=$(webapp_url "$2" 2>/dev/null) || w=
+  [ -n "$w" ] && url_covered "$u" "$w" && return 0
+  return 1
+}
+
+hide_desktop_icons() {
+  [ -n "$ICON_DIR" ] && [ -d "$ICON_DIR" ] || return 0
+  for f in "$ICON_DIR"/*.desktop; do
+    [ -f "$f" ] || continue
+    icon_matches "$f" "$1" || continue
+    b=$(basename "$f")
+    mv -f "$f" "$ICON_DIR/.appblock-disabled.$b.off" 2>/dev/null \
+      && echo "  → hid desktop icon: $b"
+  done
+  return 0
+}
+
+restore_desktop_icons() {
+  [ -n "$ICON_DIR" ] && [ -d "$ICON_DIR" ] || return 0
+  for f in "$ICON_DIR"/.appblock-disabled.*.desktop.off; do
+    [ -f "$f" ] || continue
+    icon_matches "$f" "$1" || continue
+    b=$(basename "$f"); b=${b#.appblock-disabled.}; b=${b%.off}
+    mv -f "$f" "$ICON_DIR/$b" 2>/dev/null && echo "  → restored desktop icon: $b"
+  done
+  return 0
+}
+
 # XDG autostart entries (tray/background apps) often use absolute Exec paths
 # and bypass PATH entirely. Disable on block, restore on unblock.
 disable_autostart() {
@@ -341,6 +417,7 @@ reconcile() {
     if desktop_visible "$app"; then
       hide_desktop "$app" && echo "  ↻ re-hid menu entry for $app (drift repaired)"
     fi
+    hide_desktop_icons "$app"   # re-hides an icon recreated while blocked
     if [ -d "$AUTOSTART_DIR" ]; then
       for f in "$AUTOSTART_DIR"/*.desktop; do
         [ -f "$f" ] || break
@@ -461,17 +538,21 @@ case "$cmd" in
         http://*|https://*)
           case "$cmd" in
             block)   is_blocked "$app" || echo "$app" >>"$STATE"
-                     webapp_add "$app" "$(normalize_url "$app")"; refresh_webguard ;;
+                     webapp_add "$app" "$(normalize_url "$app")"; refresh_webguard
+                     hide_desktop_icons "$app" ;;
             unblock) sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
-                     webapp_del "$app"; refresh_webguard ;;
+                     webapp_del "$app"; refresh_webguard
+                     restore_desktop_icons "$app" ;;
             toggle)  if is_blocked "$app"; then
                        sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
                        webapp_del "$app"; echo "✅ $app unblocked"
+                       refresh_webguard; restore_desktop_icons "$app"
                      else
                        echo "$app" >>"$STATE"; webapp_add "$app" "$(normalize_url "$app")"
+                       refresh_webguard; hide_desktop_icons "$app"
                        echo "🚫 $app blocked"
                      fi
-                     refresh_webguard; continue ;;
+                     continue ;;
           esac
           if is_blocked "$app"; then
             echo "🚫 $app blocked (web-app URL guard — covers this URL and paths under it)"
@@ -489,7 +570,7 @@ case "$cmd" in
           # No launch surface left (app uninstalled?) — unblocking must still
           # clear the blocklist; unhide-desktop finds nothing to undo.
           sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
-          unhide_desktop "$app"; restore_autostart "$app"
+          unhide_desktop "$app"; restore_autostart "$app"; restore_desktop_icons "$app"
           echo "✅ $app unblocked (no launch surface remains)"
         else
           echo "  ! no launch surface found for '$app' (not on PATH, no desktop/autostart entry) — skipping"
@@ -500,10 +581,10 @@ case "$cmd" in
       wurl=$(webapp_url "$entry" 2>/dev/null || true)   # web-app? record its URL
       case "$cmd" in
         block)   is_blocked "$entry" || echo "$entry" >>"$STATE";  hide_desktop "$id"; disable_autostart "$app"
-                 webapp_add "$entry" "$(normalize_url "${wurl:-}")" ;;
+                 webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry" ;;
         unblock) sed -i "/^$(printf '%s' "$entry" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"; unhide_desktop "$id"; restore_autostart "$app"
-                 webapp_del "$entry" ;;
-        toggle)  if is_blocked "$entry"; then sed -i "/^$(printf '%s' "$entry" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"; unhide_desktop "$id"; restore_autostart "$app"; webapp_del "$entry"; echo "✅ $entry unblocked"; else echo "$entry" >>"$STATE"; hide_desktop "$id"; disable_autostart "$app"; webapp_add "$entry" "$(normalize_url "${wurl:-}")"; echo "🚫 $entry blocked"; fi; continue ;;
+                 webapp_del "$entry"; restore_desktop_icons "$entry" ;;
+        toggle)  if is_blocked "$entry"; then sed -i "/^$(printf '%s' "$entry" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"; unhide_desktop "$id"; restore_autostart "$app"; webapp_del "$entry"; restore_desktop_icons "$entry"; echo "✅ $entry unblocked"; else echo "$entry" >>"$STATE"; hide_desktop "$id"; disable_autostart "$app"; webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"; echo "🚫 $entry blocked"; fi; continue ;;
       esac
       is_blocked "$entry" && echo "🚫 $entry blocked" || echo "✅ $entry unblocked"
       if [ "$shim_ok" -ne 1 ] && is_blocked "$entry"; then
