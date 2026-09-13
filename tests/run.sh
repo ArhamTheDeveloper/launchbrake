@@ -23,6 +23,19 @@ check_not() { # check_not <msg> <cmd...> — negated check
   if "$@" >/dev/null 2>&1; then bad "$msg"; else ok "$msg"; fi
 }
 
+# Friction cooldown helpers. `unblock`/`toggle` only SCHEDULE a lift (by design);
+# reconcile() performs it once the epoch passes. Rewrite every pending epoch to
+# the distant past, then run a command so reconcile fires — no sleeping.
+ab_finish_cooldown() {
+  [ -f "$HOME/.local/share/appblock/unblock-at.list" ] \
+    && sed -i 's/|[0-9]*$/|1/' "$HOME/.local/share/appblock/unblock-at.list"
+  "$AB" list >/dev/null 2>&1
+}
+ab_unblock_now() { # <app|url...> — request, then drive the cooldown to completion
+  "$AB" unblock "$@" >/dev/null 2>&1
+  ab_finish_cooldown
+}
+
 sh -n "$AB" && ok "syntax check" || bad "syntax check"
 
 # ---------- sandbox ----------
@@ -55,14 +68,19 @@ section "block / run-guard / unblock"
 "$AB" block demoapp >/dev/null 2>&1 && ok "block demoapp" || bad "block demoapp"
 check "shim file created" test -x "$HOME/.local/share/appblock/shims/demoapp"
 if demoapp 2>/dev/null; then bad "blocked app was allowed to run"; else ok "blocked app refused to run"; fi
-"$AB" unblock demoapp >/dev/null 2>&1 && ok "unblock demoapp" || bad "unblock demoapp"
+ab_unblock_now demoapp >/dev/null 2>&1 && ok "unblock demoapp" || bad "unblock demoapp"
 [ "$(demoapp)" = "hi-from-demoapp" ] && ok "app runs after unblock" || bad "app does not run after unblock"
 
 section "toggle"
 "$AB" toggle demoapp >/dev/null 2>&1
 grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list" && ok "toggle blocks" || bad "toggle blocks"
+# Friction: toggling a BLOCKED app must not lift it — it only schedules the lift.
 "$AB" toggle demoapp >/dev/null 2>&1
-! grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list" && ok "toggle unblocks" || bad "toggle unblocks"
+grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list" \
+  && ok "toggle on a blocked app stays blocked (friction)" || bad "toggle lifted the block immediately"
+ab_finish_cooldown
+! grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list" && ok "cooldown elapsed -> unblocked" \
+  || bad "cooldown did not lift the block"
 
 section "enforcement label"
 "$AB" block demoapp >/dev/null 2>&1
@@ -85,7 +103,7 @@ printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin2/demoapp --
 "$AB" list >/dev/null 2>&1
 check "reconcile re-disabled autostart after clobber" \
   grep -q '^Hidden=true' "$HOME/.config/autostart/demoapp.desktop"
-"$AB" unblock demoapp >/dev/null 2>&1
+ab_unblock_now demoapp >/dev/null 2>&1
 ! grep -q '^Hidden=' "$HOME/.config/autostart/demoapp.desktop" && ok "unblock cleared Hidden flag" \
   || bad "unblock left Hidden flag behind"
 grep -q 'bin2/demoapp --new-flag' "$HOME/.config/autostart/demoapp.desktop" \
@@ -112,7 +130,7 @@ if "$AB" list | grep -q 'chrome-chatgpt-abc123 — menu hidden + omarchy-launch-
 else
   bad "PWA label wrong"
 fi
-"$AB" unblock chatgpt >/dev/null 2>&1
+ab_unblock_now chatgpt >/dev/null 2>&1
 check "restore is byte-exact (original Exec back)" \
   grep -q -- '--app=https://chatgpt.com/' "$HOME/.local/share/applications/chrome-chatgpt-abc123.desktop"
 check "no disabled file left after restore" \
@@ -128,7 +146,7 @@ printf '[Desktop Entry]\nType=Application\nName=Figma\nExec=omarchy-launch-webap
 "$AB" list >/dev/null 2>&1
 check "reinstall drift: reconcile re-renames the fresh entry" \
   test ! -e "$HOME/.local/share/applications/Figma.desktop"
-"$AB" unblock figma >/dev/null 2>&1
+ab_unblock_now figma >/dev/null 2>&1
 
 section "ambiguous fuzzy name is rejected, not guessed"
 # second entry whose Name= collides with ChatGPT's
@@ -183,7 +201,7 @@ rm -f "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
 "$AB" list >/dev/null 2>&1
 check "guard self-heals after deletion (reconcile)" \
   test -x "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
-"$AB" unblock "https://youtube.com/" x >/dev/null 2>&1
+ab_unblock_now "https://youtube.com/" x >/dev/null 2>&1
 check "guard removed once the last URL block is lifted" \
   test ! -e "$HOME/.local/share/appblock/shims/omarchy-launch-webapp"
 [ "$(omarchy-launch-webapp "https://x.com/" 2>/dev/null)" = "launched:https://x.com/" ] \
@@ -207,7 +225,7 @@ check "  ...renamed aside, byte-preserved for restore" \
   test -f "$HOME/Desktop/.appblock-disabled.demoapp-abs.desktop.off"
 check "bare-Exec desktop icon hidden too" test ! -e "$HOME/Desktop/demoapp-bare.desktop"
 check "unrelated desktop icon untouched" test -f "$HOME/Desktop/unrelated.desktop"
-"$AB" unblock demoapp >/dev/null 2>&1
+ab_unblock_now demoapp >/dev/null 2>&1
 check "unblock restores the absolute-Exec icon" test -f "$HOME/Desktop/demoapp-abs.desktop"
 check "unblock restores the bare-Exec icon" test -f "$HOME/Desktop/demoapp-bare.desktop"
 check_not "no disabled icons left behind" \
@@ -222,17 +240,17 @@ printf '[Desktop Entry]\nType=Application\nName=Cuphead\nExec=env "WINEPREFIX=%s
 "$AB" block wine >/dev/null 2>&1
 check "env-prefixed (Wine) icon hidden — any Exec token matches" \
   test ! -e "$HOME/Desktop/game.desktop"
-"$AB" unblock wine >/dev/null 2>&1
+ab_unblock_now wine >/dev/null 2>&1
 check "env-prefixed icon restored" test -f "$HOME/Desktop/game.desktop"
 rm -f "$HOME/Desktop/game.desktop"
 
 "$AB" block x >/dev/null 2>&1
 check "web-app desktop icon hidden (matched by URL)" test ! -e "$HOME/Desktop/X.desktop"
-"$AB" unblock x >/dev/null 2>&1
+ab_unblock_now x >/dev/null 2>&1
 check "web-app desktop icon restored" test -f "$HOME/Desktop/X.desktop"
 "$AB" block "https://x.com/" >/dev/null 2>&1
 check "blocking a bare URL hides an icon for that URL" test ! -e "$HOME/Desktop/X.desktop"
-"$AB" unblock "https://x.com/" >/dev/null 2>&1
+ab_unblock_now "https://x.com/" >/dev/null 2>&1
 check "URL unblock restores it" test -f "$HOME/Desktop/X.desktop"
 
 # drift: an icon recreated while blocked is re-hidden on the next invocation
@@ -241,7 +259,7 @@ cp "$HOME/Desktop/.appblock-disabled.X.desktop.off" "$HOME/Desktop/X.desktop"
 "$AB" list >/dev/null 2>&1
 check "icon recreated while blocked is re-hidden (drift repaired)" \
   test ! -e "$HOME/Desktop/X.desktop"
-"$AB" unblock x >/dev/null 2>&1
+ab_unblock_now x >/dev/null 2>&1
 check "no duplicate icons after drift repair + unblock" \
   test -f "$HOME/Desktop/X.desktop" -a ! -e "$HOME/Desktop/.appblock-disabled.X.desktop.off"
 
@@ -252,12 +270,12 @@ printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=demoapp\n' \
   >"$HOME/MyDesk/demoapp.desktop"
 "$AB" block demoapp >/dev/null 2>&1
 check "custom XDG_DESKTOP_DIR honored" test ! -e "$HOME/MyDesk/demoapp.desktop"
-"$AB" unblock demoapp >/dev/null 2>&1
+ab_unblock_now demoapp >/dev/null 2>&1
 check "custom-dir icon restored" test -f "$HOME/MyDesk/demoapp.desktop"
 rm -f "$HOME/.config/user-dirs.dirs"
 rm -rf "$HOME/MyDesk"
 rm -rf "$HOME/Desktop"
-"$AB" block demoapp >/dev/null 2>&1 && "$AB" unblock demoapp >/dev/null 2>&1 \
+"$AB" block demoapp >/dev/null 2>&1 && ab_unblock_now demoapp >/dev/null 2>&1 \
   && ok "no desktop dir present → graceful no-op (Hyprland shape)" \
   || bad "errored when no desktop dir exists"
 
@@ -299,8 +317,244 @@ rm -f "$HOME/.local/share/appblock/shims/appblock-alias"
 PATH="$HOME/.local/share/appblock/shims:$HOME/bin2:$PATH"
 appblock list >/dev/null 2>&1 && ok "normal entry point works from shims symlink" || bad "normal entry point broken"
 
+section "timed blocks (lazy expiry)"
+# Duration parser: verify relative specs resolve to now+seconds (within a few s
+# of wall-clock drift). parse_duration_to_epoch is not exported, so exercise it
+# the way the CLI does — through `block --until` writing blocked-until.list.
+NOW=$(date +%s)
+"$AB" block demoapp --until 25m >/dev/null 2>&1
+ep=$(sed -n 's/^demoapp|//p' "$HOME/.local/share/appblock/blocked-until.list" | tail -1)
+[ -n "$ep" ] && ok "block --until writes an epoch to blocked-until.list" || bad "no epoch written"
+# allow 5s drift between NOW capture and the CLI's own date +%s
+[ -n "$ep" ] && [ "$ep" -ge $((NOW + 1500 - 5)) ] && [ "$ep" -le $((NOW + 1500 + 5)) ] \
+  && ok "epoch is now+25m (~1500s)" || bad "epoch wrong ($ep vs ~$((NOW+1500)))"
+ab_unblock_now demoapp >/dev/null 2>&1
+check "unblock clears the timed entry" test ! -s "$HOME/.local/share/appblock/blocked-until.list"
+
+# Invalid duration must be rejected, not silently blocked forever.
+"$AB" block demoapp --until NOTADURATION >/dev/null 2>&1
+invalid_failed=$?
+check "invalid --until duration rejected (non-zero exit)" [ "$invalid_failed" -ne 0 ]
+ab_unblock_now demoapp >/dev/null 2>&1
+
+# Lazy shim expiry: bake a PAST epoch into blocked-until.list, then launching the
+# shim must self-unblock (clear both lists) and exec the real binary (echoes a
+# known marker). No daemon, no wait — expiry is checked at invocation time.
+printf '#!/bin/sh\necho REALDEMOOUTPUT\n' >"$HOME/bin2/demoapp-fake"
+chmod +x "$HOME/bin2/demoapp-fake"
+ln -sfn demoapp-fake "$HOME/bin2/demoapp"
+"$AB" block demoapp >/dev/null 2>&1            # create shim, managed entry
+PAST=$(( $(date +%s) - 10 ))
+echo "demoapp|$PAST" >> "$HOME/.local/share/appblock/blocked-until.list"
+out=$(PATH="$HOME/.local/share/appblock/shims:$HOME/bin2:$PATH" demoapp 2>/dev/null)
+check "shim self-unblocks on expiry and execs real binary (lazy expiry)" [ "$out" = "REALDEMOOUTPUT" ]
+check "expiry cleared blocked-until.list" test ! -s "$HOME/.local/share/appblock/blocked-until.list"
+check_not "expiry removed app from blocked.list" grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list"
+# a still-active (future) timed block must NOT self-unblock.
+# (the lazy expiry above already unblocked the app, so block it again first)
+"$AB" block demoapp >/dev/null 2>&1
+FUTURE=$(( $(date +%s) + 3600 ))
+echo "demoapp|$FUTURE" >> "$HOME/.local/share/appblock/blocked-until.list"
+PATH="$HOME/.local/share/appblock/shims:$HOME/bin2:$PATH" demoapp >/dev/null 2>&1; ec=$?
+check "active timed block still refuses launch (exit 1)" [ "$ec" -ne 0 ]
+check "active block kept its until-entry" grep -qF "demoapp|$FUTURE" "$HOME/.local/share/appblock/blocked-until.list"
+ab_unblock_now demoapp >/dev/null 2>&1
+
+# reconcile() expiry: a past-epoch entry gets fully unblocked (unhide desktop)
+# even without a launch. Seed a fake desktop entry + icon + past epoch, run list.
+printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin/demoapp\n' "$HOME" \
+  >"$HOME/.local/share/applications/demoapp.desktop"
+"$AB" block demoapp >/dev/null 2>&1
+PAST2=$(( $(date +%s) - 10 ))
+echo "demoapp|$PAST2" >> "$HOME/.local/share/appblock/blocked-until.list"
+"$AB" list >/dev/null 2>&1   # reconcile runs here
+check_not "reconcile expires overdue timed block (not in blocked.list)" grep -qxF demoapp "$HOME/.local/share/appblock/blocked.list"
+check "reconcile cleared the until-entry" test ! -s "$HOME/.local/share/appblock/blocked-until.list"
+check_not "reconcile restored the menu override (desktop entry gone)" grep -q '^NoDisplay=true' "$HOME/.local/share/applications/demoapp.desktop"
+ab_unblock_now demoapp >/dev/null 2>&1
+rm -f "$HOME/bin2/demoapp-fake" "$HOME/.local/share/applications/demoapp.desktop"
+
+# list shows remaining time for active timed blocks
+FUT2=$(( $(date +%s) + 1500 ))
+"$AB" block demoapp >/dev/null 2>&1
+echo "demoapp|$FUT2" >> "$HOME/.local/share/appblock/blocked-until.list"
+"$AB" list 2>&1 | grep -q '25m left\|24m left\|26m left' \
+  && ok "list shows remaining time for timed block" || bad "list omitted remaining time"
+ab_unblock_now demoapp >/dev/null 2>&1
+rm -f "$HOME/.local/share/appblock/blocked-until.list"
+
+section "unblock friction (cooldown)"
+# Lifting a block is deliberately slow: `unblock`/`toggle` only SCHEDULE the
+# lift. Self-contained fixture — an earlier section moves demoapp's binary away,
+# so demoapp can no longer be launched.
+printf '#!/bin/sh\necho FRIC-RAN\n' >"$HOME/bin/fricapp"
+chmod +x "$HOME/bin/fricapp"
+printf '[Desktop Entry]\nType=Application\nName=fricapp\nExec=%s/bin/fricapp\n' "$HOME" \
+  >"$HOME/.local/share/applications/fricapp.desktop"
+printf '[Desktop Entry]\nType=Application\nName=fricapp\nExec=%s/bin/fricapp\n' "$HOME" \
+  >"$HOME/.config/autostart/fricapp.desktop"
+
+"$AB" block fricapp >/dev/null 2>&1
+# The shim is written from an UNQUOTED heredoc: a stray backtick or $(…) in a
+# comment would execute at generation time. Nothing may leak in.
+check_not "friction: shim generation ran no substituted command" grep -q \
+  'usage: appblock' "$HOME/.local/share/appblock/shims/fricapp"
+NOWF=$(date +%s)
+"$AB" unblock fricapp >/dev/null 2>&1
+check "friction: unblock does NOT lift immediately" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+ep=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+[ -n "$ep" ] && ok "friction: lift scheduled in unblock-at.list" || bad "friction: no pending lift written"
+[ -n "$ep" ] && [ "$ep" -ge $((NOWF + 595)) ] && [ "$ep" -le $((NOWF + 605)) ] \
+  && ok "friction: default cooldown is 10m" || bad "friction: default cooldown wrong ($ep)"
+"$AB" list 2>&1 | grep -q 'unblocks in 9m\|unblocks in 10m' \
+  && ok "friction: list shows the pending lift" || bad "friction: list hides the pending lift"
+if fricapp >/dev/null 2>&1; then bad "friction: app launched during cooldown"; else ok "friction: app still refused during the cooldown"; fi
+
+NOWF=$(date +%s)
+"$AB" unblock fricapp --after 2m >/dev/null 2>&1
+ep=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+[ -n "$ep" ] && [ "$ep" -ge $((NOWF + 115)) ] && [ "$ep" -le $((NOWF + 125)) ] \
+  && ok "friction: --after 2m sets the cooldown" || bad "friction: --after ignored ($ep)"
+
+# No back door: a wait under the floor, a missing duration, and --after together
+# with `block` must all be refused without disturbing the pending lift.
+"$AB" unblock fricapp --after 30s >/dev/null 2>&1; tooshort=$?
+check "friction: --after below the 60s floor refused" [ "$tooshort" -ne 0 ]
+"$AB" unblock fricapp --after >/dev/null 2>&1; nodur=$?
+check "friction: --after without a duration refused" [ "$nodur" -ne 0 ]
+"$AB" block fricapp --after 5m >/dev/null 2>&1; withblock=$?
+check "friction: --after rejected together with block" [ "$withblock" -ne 0 ]
+check "friction: refused calls left the pending lift intact" grep -q '^fricapp|' \
+  "$HOME/.local/share/appblock/unblock-at.list"
+
+# --cancel abandons the pending lift; the block itself stays.
+"$AB" unblock fricapp --cancel >/dev/null 2>&1
+check "friction: --cancel clears the pending lift" test ! -s "$HOME/.local/share/appblock/unblock-at.list"
+check "friction: --cancel leaves the app blocked" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+
+# toggle must not be a one-keystroke bypass.
+"$AB" toggle fricapp >/dev/null 2>&1
+check "friction: toggle cannot bypass the cooldown" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check "friction: toggle scheduled a lift instead" grep -q '^fricapp|' \
+  "$HOME/.local/share/appblock/unblock-at.list"
+
+# A URL block obeys the same cooldown.
+"$AB" block "https://fric.example/" >/dev/null 2>&1
+"$AB" unblock "https://fric.example/" >/dev/null 2>&1
+check "friction: URL unblock does not lift immediately" grep -qxF 'https://fric.example/' \
+  "$HOME/.local/share/appblock/blocked.list"
+check "friction: URL unblock is scheduled" grep -q '^https://fric.example/|' \
+  "$HOME/.local/share/appblock/unblock-at.list"
+
+# An elapsed cooldown really lifts both, at every layer.
+ab_finish_cooldown
+check_not "friction: elapsed cooldown lifts the app" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check_not "friction: elapsed cooldown lifted the URL" grep -qxF 'https://fric.example/' \
+  "$HOME/.local/share/appblock/blocked.list"
+check "friction: cooldown left the user desktop entry alone" test -f \
+  "$HOME/.local/share/applications/fricapp.desktop"
+check_not "friction: cooldown restored autostart" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/fricapp.desktop"
+[ "$(fricapp)" = "FRIC-RAN" ] && ok "friction: app runs after the cooldown" \
+  || bad "friction: app does not run after the cooldown"
+
+# The cooldown is honoured lazily AT LAUNCH too — no appblock command required,
+# exactly like a timed deadline passing.
+"$AB" block fricapp >/dev/null 2>&1
+"$AB" unblock fricapp >/dev/null 2>&1
+sed -i 's/|[0-9]*$/|1/' "$HOME/.local/share/appblock/unblock-at.list"   # age the wait
+out=$(fricapp 2>/dev/null)
+[ "$out" = "FRIC-RAN" ] && ok "friction: launch lifts an elapsed cooldown (lazy)" \
+  || bad "friction: launch did not lift the elapsed cooldown"
+check_not "friction: lazy launch lift cleared blocked.list" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check "friction: lazy launch lift cleared the pending entry" test ! -s \
+  "$HOME/.local/share/appblock/unblock-at.list"
+
+# A `--until` deadline passing is AUTOMATIC and must stay frictionless — it is
+# not a user-requested lift, so no cooldown may apply to it.
+"$AB" block fricapp --until 1s >/dev/null 2>&1
+sleep 2
+ab_finish_cooldown
+check_not "friction: timed deadline lifts with no cooldown" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check "friction: timed lift left no pending entry" test ! -s \
+  "$HOME/.local/share/appblock/unblock-at.list"
+
+section "reverse-DNS desktop id (shim key != launch name)"
+# Regression: an app whose desktop id (org.example.revdnsapp) differs from the
+# binary you type (revdnsapp). The shim is named after the binary but MUST key
+# off the canonical id, or blocked.list never matches and the app launches
+# anyway. NOTE: the fixture name must have no real /usr/share entry — resolution
+# reads real system dirs even inside the sandbox and would mask the bug.
+printf '#!/bin/sh\necho REVDNS-RAN\n' >"$HOME/bin/revdnsapp"
+chmod +x "$HOME/bin/revdnsapp"
+printf '[Desktop Entry]\nType=Application\nName=RevdnsApp\nExec=%s/bin/revdnsapp\n' "$HOME" \
+  >"$HOME/.local/share/applications/org.example.revdnsapp.desktop"
+printf '[Desktop Entry]\nType=Application\nName=RevdnsApp\nExec=%s/bin/revdnsapp\n' "$HOME" \
+  >"$HOME/.config/autostart/org.example.revdnsapp.desktop"
+
+"$AB" block revdnsapp >/dev/null 2>&1
+check "revdns: blocklist gets the canonical id" grep -qxF org.example.revdnsapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check "revdns: shim installed at the typed launch name" test -x \
+  "$HOME/.local/share/appblock/shims/revdnsapp"
+check "revdns: shim keyed on the canonical id, not the launch name" grep -qxF \
+  '# appblock-block-key: org.example.revdnsapp' "$HOME/.local/share/appblock/shims/revdnsapp"
+if revdnsapp >/dev/null 2>&1; then bad "revdns: blocked app was allowed to run"; else ok "revdns: blocked app refused to run"; fi
+"$AB" list 2>&1 | grep -q 'org.example.revdnsapp — enforced' \
+  && ok "revdns: list reports enforced" || bad "revdns: list lacks enforced label"
+check "revdns: autostart entry disabled" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/org.example.revdnsapp.desktop"
+
+# Timed expiry must undo autostart + shim (both are keyed on the LAUNCH name,
+# which differs from the id — the old code looked them up by the id and failed).
+PASTR=$(( $(date +%s) - 10 ))
+echo "org.example.revdnsapp|$PASTR" >>"$HOME/.local/share/appblock/blocked-until.list"
+"$AB" list >/dev/null 2>&1   # reconcile runs here
+check_not "revdns: timed expiry cleared autostart Hidden" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/org.example.revdnsapp.desktop"
+check_not "revdns: timed expiry removed the shim" test -f \
+  "$HOME/.local/share/appblock/shims/revdnsapp"
+
+ab_unblock_now revdnsapp >/dev/null 2>&1
+[ "$(revdnsapp)" = "REVDNS-RAN" ] && ok "revdns: app runs after unblock" || bad "revdns: app does not run after unblock"
+# A repeated/idempotent unblock must not delete the user's own .desktop entry
+# (the user-dir flow renames it aside; unhide must only remove OUR override).
+ab_unblock_now revdnsapp >/dev/null 2>&1
+check "revdns: repeat unblock preserves the user desktop entry" test -f \
+  "$HOME/.local/share/applications/org.example.revdnsapp.desktop"
+
+# Self-heal: a pre-fix shim is keyed on the launch name and is inert. Any
+# invocation (list runs reconcile) must rewrite it to the canonical key.
+"$AB" block revdnsapp >/dev/null 2>&1
+{
+  printf '#!/bin/sh\n'
+  printf '# generated by appblock — do not edit (refresh with: appblock shims)\n'
+  printf "if grep -qxF 'revdnsapp' \"%s/blocked.list\" 2>/dev/null; then\n" "$HOME/.local/share/appblock"
+  printf '  echo blocked\n  exit 1\nfi\n'
+  printf 'exec %s/bin/revdnsapp "$@"\n' "$HOME"
+} >"$HOME/.local/share/appblock/shims/revdnsapp"
+chmod +x "$HOME/.local/share/appblock/shims/revdnsapp"
+if revdnsapp >/dev/null 2>&1; then ok "revdns: pre-fix name-keyed shim is inert (bug shape reproduced)"; else bad "revdns: pre-fix shim unexpectedly enforced"; fi
+"$AB" list >/dev/null 2>&1
+check "revdns: self-heal rewrote the shim key" grep -qxF \
+  '# appblock-block-key: org.example.revdnsapp' "$HOME/.local/share/appblock/shims/revdnsapp"
+if revdnsapp >/dev/null 2>&1; then bad "revdns: launch allowed after self-heal"; else ok "revdns: launch refused after self-heal"; fi
+ab_unblock_now revdnsapp >/dev/null 2>&1
+
+# Empty blocklist must print cleanly (grep -c . exits 1 with no matches, which
+# used to append a second "0" and blow up the arithmetic test).
+: >"$HOME/.local/share/appblock/blocked.list"
+"$AB" list 2>&1 | grep -q 'integer expected' \
+  && bad "empty blocklist emits an integer error" || ok "empty blocklist lists cleanly"
+
 section "uninstall-cleanliness"
-"$AB" unblock demoapp >/dev/null 2>&1
+ab_unblock_now demoapp >/dev/null 2>&1
 remaining=$(wc -l <"$HOME/.local/share/appblock/blocked.list")
 [ "$remaining" -eq 0 ] && ok "blocked.list empty after unblocks" || bad "blocked.list not empty ($remaining)"
 

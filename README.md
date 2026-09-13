@@ -12,6 +12,13 @@ app menus, autostart, omarchy web-app keybinds, and desktop icons.
    Each managed app gets a small script there that checks a plaintext
    blocklist: blocked → message + exit; open → `exec`s the real binary,
    fully transparently (signals/TTY/stdin all pass through).
+   The shim is **named** for the command you type but **keyed** on the app's
+   canonical desktop id (`# appblock-block-key: org.mozilla.firefox` inside
+   the generated script), so apps whose id differs from their launch binary
+   (reverse-DNS/Flatpak-style Firefox, Discord, Spotify, …) are intercepted
+   too instead of silently falling through. `reconcile()` refreshes any shim
+   whose key no longer matches its resolved id, so installs from before this
+   fix self-heal on the next invocation.
 2. **Menu hiding** — blocked apps get a `NoDisplay=true` desktop-entry
    override, which also masks any absolute `Exec=` in the original entry
    (per Base Directory Spec, `$XDG_DATA_HOME` wins).
@@ -33,12 +40,18 @@ app menus, autostart, omarchy web-app keybinds, and desktop icons.
    unblock. On omarchy `XDG_DESKTOP_DIR="$HOME/"`, so matching is strictly
    per-`Exec`: only icons naming the blocked binary (any token, e.g.
    `env WINEPREFIX=… wine …`) or opening a blocked URL are touched.
-5. **State** — plaintext files (`blocked.list`, `managed.list`), read fresh
-   each run. Toggling is instant. Real binaries and packages are untouched,
-   so the tool survives system updates.
+5. **State** — plaintext files (`blocked.list`, `managed.list`,
+   `blocked-until.list`), read fresh each run. Toggling is instant. Real
+   binaries and packages are untouched, so the tool survives system updates.
+   The canonical id is the key everywhere (`blocked.list`, the timed-block
+   deadline, and the shim's check); the layers that are inherently keyed on
+   the launch binary (the shim file itself, autostart `Exec=`, desktop icons)
+   recover the binary name from the shim's `appblock-block-key` marker.
 6. **Name resolution** — `appblock block chatgpt` works: names are matched
    case-insensitively against desktop ids, `Name=` fields, and entry URLs.
-   An ambiguous match is reported, never guessed.
+   An ambiguous match is reported, never guessed. Whatever you type is
+   resolved to the canonical desktop id before anything is stored or
+   checked, so `block firefox` and `block org.mozilla.firefox` agree.
 7. **Web-app URL guard** — omarchy web-app keybinds (`SUPER SHIFT X` → `X`,
    YouTube, ChatGPT, …) don't read a `.desktop` entry at all: Hyprland runs
    `omarchy-launch-webapp <url>`, which picks the browser itself. So while any
@@ -56,13 +69,37 @@ install -Dm755 bin/appblock ~/.local/share/appblock/appblock
 ## Usage
 
 ```
-appblock block <app|url>...  block (terminal + launcher + keybind + systemd)
-appblock unblock <app|url>... unblock
-appblock toggle <app|url>... flip state
-appblock list                show blocked apps with honest enforcement labels
-appblock install             (re)wire PATH into every launch path
-appblock shims               refresh shims after a package upgrade moved binaries
+appblock block <app|url>... [--until <dur>]              block (terminal + launcher + keybind + systemd)
+appblock unblock <app|url>... [--after <dur>|--cancel]   request a lift (cooldown — see below)
+appblock toggle <app|url>... [--until <dur>]             flip state (unblocking still cools down)
+appblock list                                            show blocked apps with honest enforcement labels
+appblock install                                         (re)wire PATH into every launch path
+appblock shims                                           refresh shims after a package upgrade moved binaries
 ```
+
+## Timed blocks
+
+Block something for a while and let it release itself — no daemon, no cron,
+no clock drift:
+
+```sh
+appblock block rmpc --until 25m        # relative: 25m, 2h, 1h30m, 90s
+appblock block steam --until 22:30     # absolute: HH:MM (today)
+appblock block x --until "2026-09-14 09:00"
+appblock list                          # 🚫 rmpc — enforced (24m left)
+```
+
+- `--until` applies to every app/URL named in the same call (including
+  `toggle`). `unblock` clears the deadline.
+- **Lazy expiry — the deadline is checked when the app is launched**, inside
+  the shim: past it, the shim lifts the block, writes state back, and `exec`s
+  the real binary so the launch is not lost. Nothing runs in the background.
+- `reconcile()` (which runs on every `appblock` invocation) also expires
+  overdue blocks that were never launched, lifting the menu/icon/autostart
+  hiding along with them.
+- Deadlines live in `blocked-until.list` (`<id>|<epoch>`). An unparseable
+  duration is rejected with a non-zero exit rather than silently blocking
+  forever.
 
 `list` distinguishes `enforced (launch blocked)` from
 `hidden only — NOT launch-enforced` — a PATH-shim architecture cannot
@@ -70,6 +107,37 @@ intercept hand-typed absolute paths, raw dock commands, or `flatpak run` —
 and says so instead of pretending otherwise. Web-apps/PWAs are labelled per
 what is actually covered: `menu hidden + omarchy-launch-webapp guard (keybind
 intercepted)`, or plain `hidden only (…)` when no URL is known.
+
+## Unblocking takes effort
+
+Lifting a block is deliberately slow — for **every** block, timed or not.
+`unblock` and `toggle` never lift directly; they **schedule** the lift and it
+lands once the cooldown elapses:
+
+```sh
+appblock unblock rmpc              # ⏳ stays blocked for another 10m
+appblock unblock rmpc --after 30m  # wait longer (floor: 60s)
+appblock unblock rmpc --cancel     # changed your mind — stays blocked
+appblock list                      # 🚫 rmpc — enforced (unblocks in 9m)
+```
+
+- Default cooldown is **10 minutes**. `--after` raises it; anything under 60s is
+  refused, so a tiny wait can't be used as a back door.
+- The request lives in `unblock-at.list` (`<id>|<epoch>`) and is applied lazily:
+  the next time you **launch** the app (the shim sees the elapsed wait, exactly
+  like a `--until` deadline), or on the next `appblock` run via `reconcile()`.
+  No daemon, no cron. Until it lands the app is still fully blocked, at every
+  layer (shim, menu, autostart, icons, URL guard).
+- `toggle` on a blocked app schedules a lift too, so it is not a one-keystroke
+  bypass.
+- **Timed blocks stay frictionless on the way out**: a `--until` deadline passing
+  lifts automatically with no cooldown. The cooldown guards a *user-requested*
+  lift only.
+- Untimed blocks are covered as well — they have no deadline to fall back on, so
+  they are exactly where friction matters most.
+- Scope: the state files are plaintext, so editing `blocked.list` by hand bypasses
+  all of it. As elsewhere here, it's friction against your own impulses, not a
+  security boundary.
 
 ## Web-apps / PWAs
 
@@ -155,7 +223,6 @@ sh tests/run.sh   # sandboxed fake $HOME; never touches real state
 
 ## Roadmap
 
-- timed blocks (`block <app> --until 25m`, lazy expiry inside the shim)
 - `list --json` for bar widgets/plugins
 - `flatpak run <id>` interception (documented gap)
 - optional unblock friction (type a phrase)

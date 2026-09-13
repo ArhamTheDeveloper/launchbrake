@@ -43,6 +43,101 @@ touch "$STATE" "$MANAGED" "$WEBAPPS"
 
 is_blocked() { grep -qxF "$1" "$STATE"; }
 
+UNTIL="$BASE/blocked-until.list"   # <canonical-id>|<epoch-seconds>, lazy-expiry timed blocks
+touch "$UNTIL"
+
+# FRICTION: lifting a block is deliberately slow. `unblock`/`toggle` never lift
+# directly — they only SCHEDULE the lift in unblock-at.list, which reconcile()
+# performs once the cooldown elapses. There is intentionally no skip flag; the
+# only bypass is editing blocked.list by hand (friction tool, not a security
+# tool). Automatic paths — a `--until` deadline passing — are exempt by design.
+UNBLOCK_AT="$BASE/unblock-at.list"   # <canonical-id>|<epoch-seconds>, pending lift
+touch "$UNBLOCK_AT"
+UNBLOCK_WAIT_DEFAULT=600             # 10m default cooldown
+UNBLOCK_WAIT_MIN=60                  # floor: `--after 0s` must not be a back door
+
+# parse_duration_to_epoch <spec> — print absolute epoch for a relative duration
+# (25m, 2h, 1h30m, 90s) or an absolute time (HH:MM, YYYY-MM-DD HH:MM).
+# Uses GNU date -d (Arch/Omarchy); returns non-zero on unparseable input.
+parse_duration_to_epoch() {
+  spec=$1
+  case "$spec" in
+    *:*)
+      # absolute: append today's date if none given, let date -d normalize
+      case "$spec" in
+        *-*) ;;                     # already has a date
+        *) spec="$(date +%F) $spec" ;;
+      esac
+      date -d "$spec" +%s 2>/dev/null || return 1
+      ;;
+    *)
+      # relative: split into h/m/s parts (order-independent, composable)
+      secs=0; rest=$spec; got=0
+      while [ -n "$rest" ]; do
+        case "$rest" in
+          *h*) num=${rest%%h*}; num=${num##*[!0-9]}; secs=$((secs + ${num:-0}*3600)); rest=${rest#*h} ;;
+          *m*) num=${rest%%m*}; num=${num##*[!0-9]}; secs=$((secs + ${num:-0}*60));   rest=${rest#*m} ;;
+          *s)  num=${rest%%s*};  num=${num##*[!0-9]}; secs=$((secs + ${num:-0}));      rest=${rest#*s} ;;
+          *) return 1 ;;
+        esac
+        got=1
+      done
+      [ "$got" -eq 1 ] || return 1
+      echo $(( $(date +%s) + secs ))
+      ;;
+  esac
+}
+
+# Timed-block bookkeeping for blocked-until.list  (<id>|<epoch>).
+until_add() { [ -n "$2" ] && echo "$1|$2" >>"$UNTIL" || true; }   # (no-op if no epoch)
+until_del() {                                                # drop expiry for $1
+  [ -s "$UNTIL" ] || return 0
+  esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
+  sed -i "/^${esc}|/d" "$UNTIL"
+}
+# Human-readable remaining time for timed block $1, or empty if none/expired.
+until_remaining() {
+  ep=$(grep "^$1|" "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  [ -n "$ep" ] || return 0
+  now=$(date +%s); left=$((ep - now))
+  [ "$left" -le 0 ] && return 0
+  if   [ "$left" -ge 3600 ]; then printf '%dh%dm left' $((left/3600)) $((left%3600/60))
+  elif [ "$left" -ge 60 ];   then printf '%dm left' $((left/60))
+  else printf '%ds left' "$left"; fi
+}
+
+# --- friction bookkeeping for unblock-at.list (<id>|<epoch>) ------------------
+# Schedule (or re-schedule) the pending lift of $1 $2 seconds from now.
+unblock_add() {
+  [ -n "${2:-}" ] || return 0
+  esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
+  [ -s "$UNBLOCK_AT" ] && sed -i "/^${esc}|/d" "$UNBLOCK_AT"
+  printf '%s|%s\n' "$1" "$(( $(date +%s) + $2 ))" >>"$UNBLOCK_AT"
+}
+# Forget a pending lift (the block itself stays).
+unblock_del() {
+  [ -s "$UNBLOCK_AT" ] || return 0
+  esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
+  sed -i "/^${esc}|/d" "$UNBLOCK_AT"
+}
+unblock_pending() { grep -q "^$1|" "$UNBLOCK_AT" 2>/dev/null; }
+# Human-readable cooldown left for $1, or empty if none/elapsed.
+unblock_remaining() {
+  ep=$(grep "^$1|" "$UNBLOCK_AT" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  [ -n "$ep" ] || return 0
+  now=$(date +%s); left=$((ep - now))
+  [ "$left" -le 0 ] && return 0
+  if   [ "$left" -ge 3600 ]; then printf '%dh%dm' $((left/3600)) $((left%3600/60))
+  elif [ "$left" -ge 60 ];   then printf '%dm' $((left/60))
+  else printf '%ds' "$left"; fi
+}
+# Announce a scheduled (NOT lifted) unblock for canonical key $1.
+unblock_notice() {
+  _rem=$(unblock_remaining "$1")
+  echo "⏳ $1 stays blocked for another ${_rem:-moment} — lifts on the next run or launch after that"
+  echo "   longer: appblock unblock $1 --after 30m   ·   forget it: appblock unblock $1 --cancel"
+}
+
 # Find the real binary for NAME, searching PATH while skipping the shim dir.
 find_real() {
   name=$1; found=
@@ -56,7 +151,14 @@ find_real() {
 
 # Create/refresh the PATH shim for an app so 'app <args>' resolves to it.
 install_shim() {
-  name="$1"
+  name="$1"                 # launch/PATH name: shim filename, exec target, MANAGED
+  key="${2:-}"              # blocklist key: the resolved canonical desktop id
+  # Resolve the canonical key here when the caller has none (the `shims` refresh
+  # loop only knows MANAGED launch names). Same-name apps collapse to the old
+  # behaviour; reverse-DNS ids (Flatpak-style: org.mozilla.firefox) get a shim
+  # that actually matches blocked.list.
+  [ -n "$key" ] || key=$(resolve_desktop_id "$name" 2>/dev/null) || key=
+  [ -n "$key" ] || key="$name"
   # STRUCTURAL GUARD (not just convention): generated shims live under
   # $SHIMS. If one is ever (accidentally, via refactor) made to re-invoke
   # appblock, refuse rather than risk touching state/cleanup from launch
@@ -90,15 +192,59 @@ install_shim() {
   cat >"$SHIMS/$name.tmp" <<EOF
 #!/bin/sh
 # generated by appblock — do not edit (refresh with: appblock shims)
-if grep -qxF '$name' "$STATE" 2>/dev/null; then
-  echo "🚫 $name is blocked (unblock with: appblock unblock $name)" >&2
-  exit 1
+# appblock-block-key: $key
+# NAMED for the launch binary ($name) but KEYED on the canonical id above —
+# they differ for reverse-DNS desktop ids (e.g. org.mozilla.firefox).
+if grep -qxF '$key' "$STATE" 2>/dev/null; then
+  # Lazy expiry, both kinds, checked AT LAUNCH so nothing runs in the background:
+  #   - a --until deadline that has passed
+  #   - a friction cooldown ('appblock unblock') whose wait has elapsed
+  now=\$(date +%s)
+  ep=\$(grep -F '$key|' "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  up=\$(grep -F '$key|' "$UNBLOCK_AT" 2>/dev/null | tail -n1 | cut -d'|' -f2) || up=
+  reason=
+  if [ -n "\$ep" ] && [ "\$now" -ge "\$ep" ]; then reason="timed block expired"
+  elif [ -n "\$up" ] && [ "\$now" -ge "\$up" ]; then reason="cooldown elapsed"
+  fi
+  if [ -n "\$reason" ]; then
+    # NOTE: grep -v exits 1 when it filters out EVERY line, so chaining mv with
+    # && would skip the rename exactly when the last block is lifted. Write the
+    # filtered file first, then always move it into place.
+    grep -vxF '$key' "$STATE" > "$STATE.tmp" || :
+    mv -f "$STATE.tmp" "$STATE"
+    grep -vF '$key|' "$UNTIL" 2>/dev/null > "$UNTIL.tmp" || :
+    mv -f "$UNTIL.tmp" "$UNTIL"
+    grep -vF '$key|' "$UNBLOCK_AT" 2>/dev/null > "$UNBLOCK_AT.tmp" || :
+    mv -f "$UNBLOCK_AT.tmp" "$UNBLOCK_AT"
+    echo "⏳ $name \$reason, unblocking" >&2
+  else
+    echo "🚫 $name is blocked (unblock with: appblock unblock $name)" >&2
+    exit 1
+  fi
 fi
 exec "$real" "\$@"
 EOF
   mv -f "$SHIMS/$name.tmp" "$SHIMS/$name"
   chmod +x "$SHIMS/$name"
 }
+
+# --- canonical-key -> shim lookup --------------------------------------------
+# Shims are NAMED after the launch binary but key off the canonical desktop id
+# (see install_shim), so callers holding only the id (list, reconcile) need a
+# way back. The marker line embedded in every generated shim is authoritative:
+# it is emitted from the same variable as the blocklist check, so a shim that
+# carries the marker provably compares against exactly that key.
+shim_for_key() {
+  [ -n "${1:-}" ] || return 1
+  [ -f "$SHIMS/$1" ] && { printf '%s\n' "$SHIMS/$1"; return 0; }   # fast path
+  for _sf in "$SHIMS"/*; do
+    [ -f "$_sf" ] || continue
+    grep -qxF "# appblock-block-key: $1" "$_sf" 2>/dev/null && { printf '%s\n' "$_sf"; return 0; }
+  done
+  return 1
+}
+# Launch-binary name behind canonical key $1 (empty when no shim exists).
+shim_binary_for_key() { _sbk=$(shim_for_key "$1") && printf '%s\n' "${_sbk##*/}"; }
 
 # Directories GLib/menus search for .desktop entries, in override precedence
 # order. $DESKTOP_DIR (user data) is last as a SOURCE — but first as an
@@ -182,7 +328,14 @@ hide_desktop() {
 }
 
 unhide_desktop() {
-  rm -f "$DESKTOP_DIR/$1.desktop"
+  # Remove ONLY the NoDisplay override WE wrote (marker-checked). In the
+  # user-data-dir flow the live .desktop is the user's own file (web-app/PWA
+  # entry), renamed aside rather than overridden — deleting it here destroyed it
+  # on a second unblock, or after a timed expiry had already restored it.
+  if [ -f "$DESKTOP_DIR/$1.desktop" ] \
+     && grep -q '^# appblock override' "$DESKTOP_DIR/$1.desktop" 2>/dev/null; then
+    rm -f "$DESKTOP_DIR/$1.desktop"
+  fi
   if [ -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" ]; then
     mv -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" "$DESKTOP_DIR/$1.desktop" \
       && echo "  → restored desktop entry: $1"
@@ -317,11 +470,16 @@ url_covered() {
 # Does launcher file $1 point at blocked id $2?
 icon_matches() {
   ex=$(sed -n 's/^Exec=//p' "$1" | head -n1)
+  # Launcher names this icon may point at: the canonical id we were handed, plus
+  # the launch binary behind it (they differ for reverse-DNS desktop ids).
+  _im_alt=$(shim_binary_for_key "$2") || _im_alt=
   # Scan every token, not just the first: wrappers are the norm (e.g. Wine/game
   # icons are `Exec=env "WINEPREFIX=…" wine "…lnk"`, whose first token is `env`).
   for tok in $ex; do
     tok=${tok#\"}; tok=${tok%\"}; tok=${tok#\'}; tok=${tok%\'}
-    [ "${tok##*/}" = "$2" ] && return 0
+    _im_bn=${tok##*/}
+    [ "$_im_bn" = "$2" ] && return 0
+    [ -n "$_im_alt" ] && [ "$_im_bn" = "$_im_alt" ] && return 0
   done
   u=$(printf '%s' "$ex" | grep -o 'https\?://[^ "]*' | head -n1) || u=
   [ -n "$u" ] || return 1
@@ -411,7 +569,73 @@ desktop_visible() {
 # re-add their own autostart entry), or a PWA/web-app can be reinstalled,
 # which would revert the block without any command being run. Runs on every
 # appblock invocation.
+# A shim whose embedded key no longer matches the canonical id for its launch
+# name is inert (the pre-fix reverse-DNS bug: shim named `firefox`, keyed on
+# `firefox`, while blocked.list held `org.mozilla.firefox`). Regenerate those in
+# place so an existing install self-heals on the next invocation instead of
+# staying silently unenforced. Cheap: only already-existing shims are inspected.
+heal_shims() {
+  [ -s "$MANAGED" ] || return 0
+  grep -vxF '' "$MANAGED" 2>/dev/null | while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    [ -f "$SHIMS/$a" ] || continue
+    want=$(resolve_desktop_id "$a" 2>/dev/null) || want=
+    want=${want:-$a}
+    cur=$(sed -n 's/^# appblock-block-key: //p' "$SHIMS/$a" | head -n1)
+    [ "$cur" = "$want" ] && continue
+    if install_shim "$a" "$want"; then
+      echo "  ↻ refreshed shim key for $a (${cur:-none} → $want)"
+    fi
+  done
+}
+
 reconcile() {
+  heal_shims
+
+  # FRICTION cooldown: a lift requested via `unblock`/`toggle` is only SCHEDULED
+  # — it lands here once its wait elapses. This is the ONLY path that performs a
+  # user-requested lift, and there is deliberately no flag that skips the wait.
+  if [ -s "$UNBLOCK_AT" ]; then
+    now=$(date +%s)
+    while IFS='|' read -r id epoch; do
+      [ -n "$id" ] && [ -n "$epoch" ] || continue
+      [ "$now" -ge "$epoch" ] || continue
+      esc=$(printf '%s' "$id" | sed 's/[][\.*^$/]/\\&/g')
+      sed -i "/^${esc}$/d" "$STATE"
+      sed -i "/^${esc}|/d" "$UNBLOCK_AT"
+      # shim + autostart key on the LAUNCH binary name, not the canonical id.
+      _bk=$(shim_binary_for_key "$id" || :); _bk=${_bk:-$id}
+      unhide_desktop "$id"; restore_autostart "$_bk"; restore_desktop_icons "$id"
+      webapp_del "$id"; until_del "$id"
+      echo "✅ $id cooldown elapsed — unblocked"
+    done < "$UNBLOCK_AT"
+    refresh_webguard
+  fi
+
+  # Lazy timed-expiry, part 1: the shim lifts a launch the instant its deadline
+  # passes — but menu/icons/autostart only get repaired here (on every run), so
+  # expire any overdue timed block fully even if it was never launched.
+  if [ -s "$UNTIL" ]; then
+    now=$(date +%s)
+    while IFS='|' read -r id epoch; do
+      [ -n "$id" ] && [ -n "$epoch" ] || continue
+      [ "$now" -ge "$epoch" ] || continue
+      esc=$(printf '%s' "$id" | sed 's/[][\.*^$/]/\\&/g')
+      sed -i "/^${esc}$/d" "$STATE"
+      sed -i "/^${esc}|/d" "$UNTIL"
+      sed -i "/^${esc}|/d" "$UNBLOCK_AT"   # deadline beat any pending lift
+      # shim + autostart are keyed on the LAUNCH binary name, not the canonical
+      # id — resolve it back through the shim marker (falls back to the id for
+      # same-name apps and for shim-less web-apps).
+      _bk=$(shim_binary_for_key "$id" || :); _bk=${_bk:-$id}
+      unhide_desktop "$id"; restore_autostart "$_bk"; restore_desktop_icons "$id"
+      rm -f "$SHIMS/$_bk"
+      webapp_del "$id"
+      echo "⏳ $id timed block expired — unblocked"
+    done < "$UNTIL"
+    refresh_webguard
+  fi
+
   grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
     [ -n "$app" ] || continue
     if desktop_visible "$app"; then
@@ -422,8 +646,10 @@ reconcile() {
       for f in "$AUTOSTART_DIR"/*.desktop; do
         [ -f "$f" ] || break
         ex=$(sed -n 's/^Exec=//p' "$f" | head -n1 | cut -d' ' -f1)
-        [ "${ex##*/}" = "$app" ] || continue
-        grep -q '^Hidden=true' "$f" || { disable_autostart "$app"; break; }
+        _bn=${ex##*/}
+        _alt=$(shim_binary_for_key "$app") || _alt=
+        if [ "$_bn" != "$app" ] && { [ -z "$_alt" ] || [ "$_bn" != "$_alt" ]; }; then continue; fi
+        grep -q '^Hidden=true' "$f" || { disable_autostart "$_bn"; break; }
       done
     fi
   done
@@ -486,14 +712,16 @@ enforcement_label() {
     http://*|https://*)
       echo "web-app URL guard (keybind/launcher intercepted)"; return 0 ;;
   esac
-  if [ -f "$SHIMS/$1" ]; then
-    t=$(sed -n 's/^exec "\([^"]*\)" .*/\1/p' "$SHIMS/$1")
+  _el_shim=$(shim_for_key "$1") || _el_shim=
+  if [ -n "$_el_shim" ]; then
+    _el_bin=${_el_shim##*/}          # launch name: exec target / re-resolve name
+    t=$(sed -n 's/^exec "\([^"]*\)" .*/\1/p' "$_el_shim")
     if [ -n "$t" ] && [ -x "$t" ]; then
       echo "enforced"
-    elif [ -n "$(find_real "$1")" ]; then
+    elif [ -n "$(find_real "$_el_bin")" ]; then
       echo "enforced (shim stale — refresh with 'appblock shims')"
     else
-      echo "hidden only — target gone (re-run 'appblock block $1' to refresh)"
+      echo "hidden only — target gone (re-run 'appblock block $_el_bin' to refresh)"
     fi
   elif [ -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" ]; then
     if webguarded "$1"; then
@@ -527,6 +755,39 @@ case "$cmd" in
   block|unblock|toggle)
     [ $# -ge 1 ] || { echo "usage: appblock $cmd <app...>"; exit 2; }
     ensure_path
+    # Peel off --until <duration> (block deadline) and the friction knobs
+    # --after <duration> / --cancel (lift cooldown). They apply to every app/URL
+    # named in the same call.
+    until_epoch=
+    after_secs=
+    cancel_pending=
+    _args=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --until)
+          [ $# -ge 2 ] || { echo "  ! --until needs a duration (e.g. 25m, 2h, 1h30m)" >&2; exit 2; }
+          until_epoch=$(parse_duration_to_epoch "$2") \
+            || { echo "  ! unparseable --until duration '$2'" >&2; exit 2; }
+          shift 2 ;;
+        --after)
+          [ $# -ge 2 ] || { echo "  ! --after needs a duration (e.g. 10m, 1h)" >&2; exit 2; }
+          _t=$(parse_duration_to_epoch "$2") \
+            || { echo "  ! unparseable --after duration '$2'" >&2; exit 2; }
+          after_secs=$(( _t - $(date +%s) ))
+          [ "$after_secs" -ge "$UNBLOCK_WAIT_MIN" ] \
+            || { echo "  ! --after must be at least ${UNBLOCK_WAIT_MIN}s — that wait IS the feature; to lift a block now, edit $STATE" >&2; exit 2; }
+          shift 2 ;;
+        --cancel)
+          cancel_pending=1; shift ;;
+        *) _args="$_args $1"; shift ;;
+      esac
+    done
+    eval "set -- $_args"
+    [ $# -ge 1 ] || { echo "usage: appblock $cmd <app...>"; exit 2; }
+    if [ "$cmd" = "block" ] && { [ -n "$after_secs" ] || [ -n "$cancel_pending" ]; }; then
+      echo "  ! --after/--cancel apply to unblock (and toggle); blocking is immediate" >&2; exit 2
+    fi
+    [ -n "$after_secs" ] || after_secs=$UNBLOCK_WAIT_DEFAULT
     for app in "$@"; do
       if [ "$app" = "appblock" ]; then
         echo "  ! won't block appblock itself"; continue
@@ -539,39 +800,51 @@ case "$cmd" in
           case "$cmd" in
             block)   is_blocked "$app" || echo "$app" >>"$STATE"
                      webapp_add "$app" "$(normalize_url "$app")"; refresh_webguard
-                     hide_desktop_icons "$app" ;;
-            unblock) sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
-                     webapp_del "$app"; refresh_webguard
-                     restore_desktop_icons "$app" ;;
+                     hide_desktop_icons "$app"; until_add "$app" "$until_epoch" ;;
+            unblock) if [ -n "$cancel_pending" ]; then
+                       unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
+                     elif is_blocked "$app" || unblock_pending "$app"; then
+                       unblock_add "$app" "$after_secs"; unblock_notice "$app"
+                     else
+                       echo "  ! $app is not blocked"
+                     fi
+                     continue ;;
             toggle)  if is_blocked "$app"; then
-                       sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
-                       webapp_del "$app"; echo "✅ $app unblocked"
-                       refresh_webguard; restore_desktop_icons "$app"
+                       if [ -n "$cancel_pending" ]; then
+                         unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
+                       else
+                         unblock_add "$app" "$after_secs"; unblock_notice "$app"
+                       fi
                      else
                        echo "$app" >>"$STATE"; webapp_add "$app" "$(normalize_url "$app")"
                        refresh_webguard; hide_desktop_icons "$app"
-                       echo "🚫 $app blocked"
+                       until_add "$app" "$until_epoch"; echo "🚫 $app blocked"
                      fi
                      continue ;;
           esac
-          if is_blocked "$app"; then
-            echo "🚫 $app blocked (web-app URL guard — covers this URL and paths under it)"
-          else
-            echo "✅ $app unblocked"
-          fi
+          echo "🚫 $app blocked (web-app URL guard — covers this URL and paths under it)"
           continue ;;
       esac
       ok=0
       shim_ok=0
-      install_shim "$app" && { shim_ok=1; ok=1; }
+      # Resolve FIRST so the shim can be keyed on the canonical id rather than the
+      # raw typed name: for reverse-DNS desktop ids (org.mozilla.firefox) they
+      # differ, and a name-keyed shim could never match blocked.list. Both calls
+      # only OR into `ok`, so the reorder changes nothing else.
       id=$(resolve_desktop_id "$app") && ok=1
+      entry=${id:-$app}
+      install_shim "$app" "$entry" && { shim_ok=1; ok=1; }
       if [ "$ok" -ne 1 ]; then
-        if [ "$cmd" = "unblock" ]; then
-          # No launch surface left (app uninstalled?) — unblocking must still
-          # clear the blocklist; unhide-desktop finds nothing to undo.
-          sed -i "/^$(printf '%s' "$app" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"
-          unhide_desktop "$app"; restore_autostart "$app"; restore_desktop_icons "$app"
-          echo "✅ $app unblocked (no launch surface remains)"
+        if [ "$cmd" = "unblock" ] || { [ "$cmd" = "toggle" ] && is_blocked "$app"; }; then
+          # No launch surface left (app uninstalled?) — the blocklist still gets
+          # cleared at lift time, and the cooldown still applies.
+          if [ -n "$cancel_pending" ]; then
+            unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
+          elif is_blocked "$app" || unblock_pending "$app"; then
+            unblock_add "$app" "$after_secs"; unblock_notice "$app"
+          else
+            echo "  ! $app is not blocked"
+          fi
         else
           echo "  ! no launch surface found for '$app' (not on PATH, no desktop/autostart entry) — skipping"
         fi
@@ -581,13 +854,28 @@ case "$cmd" in
       wurl=$(webapp_url "$entry" 2>/dev/null || true)   # web-app? record its URL
       case "$cmd" in
         block)   is_blocked "$entry" || echo "$entry" >>"$STATE";  hide_desktop "$id"; disable_autostart "$app"
-                 webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry" ;;
-        unblock) sed -i "/^$(printf '%s' "$entry" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"; unhide_desktop "$id"; restore_autostart "$app"
-                 webapp_del "$entry"; restore_desktop_icons "$entry" ;;
-        toggle)  if is_blocked "$entry"; then sed -i "/^$(printf '%s' "$entry" | sed 's/[][\.*^$/]/\\&/g')$/d" "$STATE"; unhide_desktop "$id"; restore_autostart "$app"; webapp_del "$entry"; restore_desktop_icons "$entry"; echo "✅ $entry unblocked"; else echo "$entry" >>"$STATE"; hide_desktop "$id"; disable_autostart "$app"; webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"; echo "🚫 $entry blocked"; fi; continue ;;
+                 webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"; until_add "$entry" "$until_epoch"
+                 echo "🚫 $entry blocked" ;;
+        unblock) if [ -n "$cancel_pending" ]; then
+                   unblock_del "$entry"; echo "🚫 $entry stays blocked — pending unblock cancelled"
+                 elif is_blocked "$entry" || unblock_pending "$entry"; then
+                   unblock_add "$entry" "$after_secs"; unblock_notice "$entry"
+                 else
+                   echo "  ! $entry is not blocked"
+                 fi ;;
+        toggle)  if is_blocked "$entry"; then
+                   if [ -n "$cancel_pending" ]; then
+                     unblock_del "$entry"; echo "🚫 $entry stays blocked — pending unblock cancelled"
+                   else
+                     unblock_add "$entry" "$after_secs"; unblock_notice "$entry"
+                   fi
+                 else
+                   echo "$entry" >>"$STATE"; hide_desktop "$id"; disable_autostart "$app"
+                   webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"
+                   until_add "$entry" "$until_epoch"; echo "🚫 $entry blocked"
+                 fi ;;
       esac
-      is_blocked "$entry" && echo "🚫 $entry blocked" || echo "✅ $entry unblocked"
-      if [ "$shim_ok" -ne 1 ] && is_blocked "$entry"; then
+      if [ "$cmd" = "block" ] && [ "$shim_ok" -ne 1 ]; then
         if [ -n "$wurl" ]; then
           echo "  (menu hiding + web-app URL guard — no PATH binary to shim)"
         else
@@ -601,11 +889,12 @@ case "$cmd" in
   list)
     reconcile
     echo "Blocked apps:"
-    n=$(grep -c . "$STATE" 2>/dev/null || echo 0)
+    n=$(grep -c . "$STATE" 2>/dev/null || :); n=${n:-0}
     [ "$n" -eq 0 ] && echo "  (none)"
     grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
       [ -n "$app" ] || continue
-      echo "  🚫 $app — $(enforcement_label "$app")"
+      _u=$(until_remaining "$app"); _p=$(unblock_remaining "$app")
+      echo "  🚫 $app — $(enforcement_label "$app")${_u:+" ($_u)"}${_p:+" (unblocks in $_p)"}"
     done
     echo "Managed apps (add more: appblock block <app>):"
     grep -vxF '' "$MANAGED" 2>/dev/null | sed 's/^/  - /' || echo "  (none)"
