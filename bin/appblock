@@ -1,13 +1,23 @@
 #!/bin/sh
 # appblock — block/unblock distracting apps (works for terminal AND launcher)
 # Usage:
-#   appblock block <app|url> [app...]    add apps/web-app URLs to the blocklist
-#   appblock unblock <app|url> [app...]  remove apps from the blocklist
+#   appblock block <app|url> [app...] [--until <dur>] [--keep-running]
+#       add apps/web-app URLs to the blocklist. --until blocks only until then
+#       and lifts AUTOMATICALLY (25m, 2h, 1h30m, 22:30, "2026-09-14 09:00").
+#       Blocking an applet that is already running stops it, so its tray/bar
+#       icon goes too; --keep-running leaves the running applet alone.
+#   appblock unblock <app|url> [app...] [--after <dur>|--cancel]
+#       request a lift: it is SCHEDULED and lands once the cooldown elapses
+#       (default 10m). --after waits longer first; --cancel drops the request.
 #   appblock toggle <app|url> [app...]   flip blocked state for apps
-#   appblock list                    show managed + blocked apps
+#   appblock list [--json]           show managed + blocked apps (--json = machine-readable)
 #   appblock shims                   (re)install PATH shims for managed apps
+#   appblock --version               print the version (consumers check this)
 
 set -eu
+
+VERSION=0.2.0
+JSON_SCHEMA=1
 
 BASE="$HOME/.local/share/appblock"
 SHIMS="$BASE/shims"
@@ -95,9 +105,18 @@ until_del() {                                                # drop expiry for $
   esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
   sed -i "/^${esc}|/d" "$UNTIL"
 }
+# Raw epoch of the <id>|<epoch> entry for $2 in list-file $1, or empty. The one
+# place that knows how these files are keyed: callers need the NUMBER (JSON,
+# countdowns) or the derived label, never their own grep — a second copy of the
+# key rule is how the shim/blocklist key mismatch happened in the first place.
+list_epoch() {
+  _le=$(printf '%s' "$2" | sed 's/[][\\.*^$/]/\\&/g')
+  grep "^${_le}|" "$1" 2>/dev/null | tail -n1 | cut -d'|' -f2
+}
+
 # Human-readable remaining time for timed block $1, or empty if none/expired.
 until_remaining() {
-  ep=$(grep "^$1|" "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  ep=$(list_epoch "$UNTIL" "$1")
   [ -n "$ep" ] || return 0
   now=$(date +%s); left=$((ep - now))
   [ "$left" -le 0 ] && return 0
@@ -107,12 +126,33 @@ until_remaining() {
 }
 
 # --- friction bookkeeping for unblock-at.list (<id>|<epoch>) ------------------
-# Schedule (or re-schedule) the pending lift of $1 $2 seconds from now.
+# Schedule the pending lift of $1 $2 seconds from now. $3 is "keep" (default)
+# or "extend":
+#   keep   — a plain `unblock`/retry. If a lift is ALREADY pending it is left
+#            exactly as it was. Retrying is the natural response to "it hasn't
+#            unblocked yet"; re-arming the whole cooldown from this moment on
+#            every retry (the old behaviour) pushed the deadline further out
+#            each time, so asking again was the one thing that made the wait
+#            never end.
+#   extend — an explicit `--after`, i.e. a fresh instruction. It counts from now
+#            even when a lift is already pending, and may shorten it: the user
+#            just said how long they want to wait.
+# Sets unblock_kept_earlier when an existing pending lift won, so the caller can
+# report "already scheduled" instead of pretending something changed.
 unblock_add() {
   [ -n "${2:-}" ] || return 0
+  unblock_kept_earlier=
   esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
-  [ -s "$UNBLOCK_AT" ] && sed -i "/^${esc}|/d" "$UNBLOCK_AT"
-  printf '%s|%s\n' "$1" "$(( $(date +%s) + $2 ))" >>"$UNBLOCK_AT"
+  want=$(( $(date +%s) + $2 ))
+  have=$(list_epoch "$UNBLOCK_AT" "$1")
+  if [ "${3:-keep}" = "keep" ] && [ -n "$have" ]; then
+    unblock_kept_earlier=1
+    return 0
+  fi
+  if [ -n "$have" ]; then
+    sed -i "/^${esc}|/d" "$UNBLOCK_AT"
+  fi
+  printf '%s|%s\n' "$1" "$want" >>"$UNBLOCK_AT"
 }
 # Forget a pending lift (the block itself stays).
 unblock_del() {
@@ -120,10 +160,16 @@ unblock_del() {
   esc=$(printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g')
   sed -i "/^${esc}|/d" "$UNBLOCK_AT"
 }
-unblock_pending() { grep -q "^$1|" "$UNBLOCK_AT" 2>/dev/null; }
+unblock_pending() { [ -n "$(list_epoch "$UNBLOCK_AT" "$1")" ]; }
+# Wall-clock time of the pending lift for $1, or empty if none/elapsed.
+unblock_at_time() {
+  ep=$(list_epoch "$UNBLOCK_AT" "$1")
+  [ -n "$ep" ] || return 0
+  date -d "@$ep" +%H:%M 2>/dev/null
+}
 # Human-readable cooldown left for $1, or empty if none/elapsed.
 unblock_remaining() {
-  ep=$(grep "^$1|" "$UNBLOCK_AT" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  ep=$(list_epoch "$UNBLOCK_AT" "$1")
   [ -n "$ep" ] || return 0
   now=$(date +%s); left=$((ep - now))
   [ "$left" -le 0 ] && return 0
@@ -132,10 +178,20 @@ unblock_remaining() {
   else printf '%ds' "$left"; fi
 }
 # Announce a scheduled (NOT lifted) unblock for canonical key $1.
+# Naming the exact clock time matters: the old wording said "another 10m" and
+# then advertised "--after 30m", so it read as "your block now lasts 30 minutes"
+# rather than "here is how to ask for a longer wait".
 unblock_notice() {
   _rem=$(unblock_remaining "$1")
-  echo "⏳ $1 stays blocked for another ${_rem:-moment} — lifts on the next run or launch after that"
-  echo "   longer: appblock unblock $1 --after 30m   ·   forget it: appblock unblock $1 --cancel"
+  _at=$(unblock_at_time "$1")
+  if [ -n "$unblock_kept_earlier" ]; then
+    echo "⏳ $1 already has a lift scheduled — still blocked until ${_at:-soon} (${_rem:-moments} left)"
+  else
+    echo "⏳ $1 stays blocked for another ${_rem:-moment} — lift scheduled for ${_at:-soon}"
+  fi
+  echo "   it lands on the next run or launch after that (no daemon waiting in the background)"
+  echo "   wait longer first:  appblock unblock $1 --after 1h"
+  echo "   changed your mind:  appblock unblock $1 --cancel"
 }
 
 # Find the real binary for NAME, searching PATH while skipping the shim dir.
@@ -195,33 +251,7 @@ install_shim() {
 # appblock-block-key: $key
 # NAMED for the launch binary ($name) but KEYED on the canonical id above —
 # they differ for reverse-DNS desktop ids (e.g. org.mozilla.firefox).
-if grep -qxF '$key' "$STATE" 2>/dev/null; then
-  # Lazy expiry, both kinds, checked AT LAUNCH so nothing runs in the background:
-  #   - a --until deadline that has passed
-  #   - a friction cooldown ('appblock unblock') whose wait has elapsed
-  now=\$(date +%s)
-  ep=\$(grep -F '$key|' "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
-  up=\$(grep -F '$key|' "$UNBLOCK_AT" 2>/dev/null | tail -n1 | cut -d'|' -f2) || up=
-  reason=
-  if [ -n "\$ep" ] && [ "\$now" -ge "\$ep" ]; then reason="timed block expired"
-  elif [ -n "\$up" ] && [ "\$now" -ge "\$up" ]; then reason="cooldown elapsed"
-  fi
-  if [ -n "\$reason" ]; then
-    # NOTE: grep -v exits 1 when it filters out EVERY line, so chaining mv with
-    # && would skip the rename exactly when the last block is lifted. Write the
-    # filtered file first, then always move it into place.
-    grep -vxF '$key' "$STATE" > "$STATE.tmp" || :
-    mv -f "$STATE.tmp" "$STATE"
-    grep -vF '$key|' "$UNTIL" 2>/dev/null > "$UNTIL.tmp" || :
-    mv -f "$UNTIL.tmp" "$UNTIL"
-    grep -vF '$key|' "$UNBLOCK_AT" 2>/dev/null > "$UNBLOCK_AT.tmp" || :
-    mv -f "$UNBLOCK_AT.tmp" "$UNBLOCK_AT"
-    echo "⏳ $name \$reason, unblocking" >&2
-  else
-    echo "🚫 $name is blocked (unblock with: appblock unblock $name)" >&2
-    exit 1
-  fi
-fi
+$(blockcheck_body "$key" "$name")
 exec "$real" "\$@"
 EOF
   mv -f "$SHIMS/$name.tmp" "$SHIMS/$name"
@@ -306,6 +336,144 @@ resolve_desktop_id() {
   return 1
 }
 
+# --- by-id .desktop launch interception (deny scripts) ------------------------
+# `gtk-launch <id>.desktop` — the Omarchy launcher/dock/taskbar call — ignores
+# NoDisplay=true: GLib resolves the user-dir override and RUNS its Exec, and if
+# that Exec cannot spawn (the pre-fix `Exec=<id>` for reverse-DNS ids), it
+# silently falls through to the real system entry, launching the blocked app.
+# So the override's Exec is ALWAYS an absolute path to a generated deny script
+# that provably hits the same block-check as the PATH shims — never the raw id.
+
+# The deny script path for canonical key $1.
+deny_path() {
+  printf '%s/.appblock-deny.%s\n' "$SHIMS" "$1"
+}
+
+# True when a by-id .desktop launch of $1 is actually intercepted right now:
+# our NoDisplay override is live, its Exec is the absolute deny path (not the
+# raw id), and the deny script exists. This — NOT the presence of NoDisplay —
+# is the basis for the "launcher masked" label; the gtk-launch click-through
+# tests demonstrate the behavior it keys on.
+launcher_masked() {
+  ov="$DESKTOP_DIR/$1.desktop"
+  [ -f "$ov" ] || return 1
+  grep -q '^# appblock override' "$ov" 2>/dev/null || return 1
+  grep -qF "Exec=$(deny_path "$1")" "$ov" 2>/dev/null || return 1
+  [ -f "$(deny_path "$1")" ] || return 1
+  return 0
+}
+
+# The real executable behind key $1, for the deny script's lift-and-exec tail
+# (a passed --until deadline / elapsed cooldown opens the app instead of
+# dropping the launch — same lazy semantics as the PATH shim). Prefers the
+# shim's recorded exec target, then the original desktop entry's Exec. Empty
+# when nothing resolvable: the deny script then refuses while blocked and lets
+# an expired lift just drop the launch attempt (reconcile finishes the cleanup).
+real_for_key() {
+  key=$1
+  _kf=$(shim_for_key "$key" 2>/dev/null) || _kf=
+  if [ -n "$_kf" ]; then
+    _kr=$(sed -n 's/^exec "\([^"]*\)" .*/\1/p' "$_kf" | head -n1)
+    [ -n "$_kr" ] && [ -x "$_kr" ] && { printf '%s\n' "$_kr"; return 0; }
+  fi
+  _kdf=$(find_desktop_file "$key" 2>/dev/null) || return 1
+  _kex=$(sed -n 's/^Exec=//p' "$_kdf" | head -n1)
+  for _kt in $_kex; do
+    case "$_kt" in %*|*=*) continue ;; esac
+    _ktt=${_kt#\"}; _ktt=${_ktt%\"}; _ktt=${_ktt#\'}; _ktt=${_ktt%\'}
+    case "$_ktt" in
+      /*) _kr=$_ktt ;;
+      *)  _kr=$(find_real "$_ktt" 2>/dev/null) || _kr= ;;
+    esac
+    [ -n "$_kr" ] && [ -x "$_kr" ] && { printf '%s\n' "$_kr"; return 0; }
+  done
+  return 1
+}
+
+# The block-check + lazy-lift body shared by PATH shims AND by-id deny scripts,
+# emitted into both generated scripts so the launch decision stays ONE code
+# path and can never diverge between surfaces. Prints the body for key $1 with
+# $2 as the display name used in its messages.
+blockcheck_body() {
+  cat <<EOF
+if grep -qxF '$1' "$STATE" 2>/dev/null; then
+  now=\$(date +%s)
+  ep=\$(grep -F '$1|' "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
+  up=\$(grep -F '$1|' "$UNBLOCK_AT" 2>/dev/null | tail -n1 | cut -d'|' -f2) || up=
+  reason=
+  if [ -n "\$ep" ] && [ "\$now" -ge "\$ep" ]; then reason="timed block expired"
+  elif [ -n "\$up" ] && [ "\$now" -ge "\$up" ]; then reason="cooldown elapsed"
+  fi
+  if [ -n "\$reason" ]; then
+    # NOTE: grep -v exits 1 when it filters out EVERY line, so chaining mv with
+    # && would skip the rename exactly when the last block is lifted. Write the
+    # filtered file first, then always move it into place.
+    grep -vxF '$1' "$STATE" > "$STATE.tmp" || :
+    mv -f "$STATE.tmp" "$STATE"
+    grep -vF '$1|' "$UNTIL" 2>/dev/null > "$UNTIL.tmp" || :
+    mv -f "$UNTIL.tmp" "$UNTIL"
+    grep -vF '$1|' "$UNBLOCK_AT" 2>/dev/null > "$UNBLOCK_AT.tmp" || :
+    mv -f "$UNBLOCK_AT.tmp" "$UNBLOCK_AT"
+    # This launch IS the lift — no appblock command ran — so the MENU layer must
+    # not stay hidden behind it. reconcile() only ever revisits apps that are
+    # still in the blocklist and nothing else comes back for this key, so
+    # without this the entry we masked stays masked forever: the app launches
+    # fine but has silently vanished from every menu/launcher. (Autostart and
+    # desktop icons are keyed on the launch binary rather than this key, so they
+    # are finished by reconcile's stale sweep instead.)
+    if [ -f "$DESKTOP_DIR/$1.desktop" ] \
+       && grep -q '^# appblock override' "$DESKTOP_DIR/$1.desktop" 2>/dev/null; then
+      rm -f "$DESKTOP_DIR/$1.desktop"
+    fi
+    if [ -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" ]; then
+      mv -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" "$DESKTOP_DIR/$1.desktop"
+    fi
+    rm -f "$SHIMS/.appblock-deny.$1"
+    echo "⏳ $2 \$reason, unblocking" >&2
+  else
+    echo "🚫 $2 is blocked (unblock with: appblock unblock $2)" >&2
+    exit 1
+  fi
+fi
+EOF
+}
+
+# Write the deny script for canonical key $1; $2 is the lift-and-exec target
+# (empty/none is fine — the refusal path is what always runs while blocked).
+deny_write() {
+  key=$1; real=${2:-}
+  d=$(deny_path "$key")
+  tail=
+  if [ -n "$real" ]; then
+    tail="exec \"$real\" \"\$@\""
+  fi
+  cat >"$d.tmp" <<EOF
+#!/bin/sh
+# generated by appblock — by-id .desktop launch check (do not edit)
+# appblock-block-key: $key
+# Exec= target of $key's NoDisplay override. NoDisplay=true only hides a menu
+# listing; a by-id launcher (gtk-launch <id>.desktop, dock/taskbar, D-Bus)
+# ignores it and runs this Exec — and would silently fall through to the real
+# system entry if it could not spawn. Absolute path, so it always spawns, and
+# the block-check is the same code path the PATH shims use.
+$(blockcheck_body "$key" "$key")
+$tail
+EOF
+  mv -f "$d.tmp" "$d"
+  chmod +x "$d"
+}
+
+# Drop deny scripts for apps no longer blocked, so no permanent indirection
+# survives the last block. Blocked apps keep theirs; reconcile re-asserts any
+# that go missing.
+refresh_denies() {
+  for f in "$SHIMS"/.appblock-deny.*; do
+    [ -f "$f" ] || continue
+    key=${f#"$SHIMS/.appblock-deny."}
+    is_blocked "$key" || rm -f "$f"
+  done
+}
+
 # Hide the app's .desktop entry from app menus.
 #   system/flatpak dir source → NoDisplay override (Base Directory Spec:
 #   $XDG_DATA_HOME always wins — verified against GLib GAppInfo).
@@ -321,8 +489,16 @@ hide_desktop() {
         && echo "  → hid desktop entry: $id (web-app/PWA, reversible)"
       ;;
     *)
-      printf '[Desktop Entry]\n# appblock override — do not edit\nType=Application\nName=%s\nNoDisplay=true\nExec=%s\n' "$id" "$id" \
-        >"$DESKTOP_DIR/$id.desktop"
+      # By-id launcher clicks resolve THIS override and run its Exec. NoDisplay
+      # is the menu-listing key only — a by-id gtk-launch ignores it and, if
+      # the Exec cannot spawn (the old Exec=<id> shape for reverse-DNS ids),
+      # falls through to the real system entry that then launches. So Exec is
+      # ALWAYS the absolute deny-script path: a command guaranteed to hit the
+      # block check for every app, same-name or reverse-DNS — never the id.
+      _dr=$(real_for_key "$id" 2>/dev/null) || _dr=
+      deny_write "$id" "${_dr:-}"
+      printf '[Desktop Entry]\n# appblock override — do not edit\nType=Application\nName=%s\nNoDisplay=true\nExec=%s\n' \
+        "$id" "$(deny_path "$id")" >"$DESKTOP_DIR/$id.desktop"
       ;;
   esac
 }
@@ -340,17 +516,7 @@ unhide_desktop() {
     mv -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" "$DESKTOP_DIR/$1.desktop" \
       && echo "  → restored desktop entry: $1"
   fi
-  return 0
-}
-
-# True if a menu would currently show $1 — i.e. a live desktop entry that is
-# NOT masked by our NoDisplay override and not renamed aside (web-app/PWA).
-desktop_visible() {
-  src=$(find_desktop_file "$1") || return 1
-  case "$src" in
-    "$DESKTOP_DIR"/*) grep -q '^NoDisplay=true' "$src" && return 1 ;;
-  esac
-  [ -f "$DESKTOP_DIR/$1.desktop" ] && grep -q '^NoDisplay=true' "$DESKTOP_DIR/$1.desktop" 2>/dev/null && return 1
+  rm -f "$SHIMS/.appblock-deny.$1"
   return 0
 }
 
@@ -530,6 +696,59 @@ disable_autostart() {
   done
 }
 
+# Stop the running process that the entry we just disabled started. A tray
+# applet (Remmina, Discord, Dropbox, …) is a LIVE process: hiding its autostart
+# entry only stops the next login, while the icon the user is looking at — on
+# the omarchy bar, waybar, or any other StatusNotifierItem host — belongs to the
+# process. Disabling the entry AND leaving the applet running is the half-done
+# answer, so block also stops it.
+#
+# Deliberately surgical: the only thing ever touched is the systemd user unit
+# omarchy/uwsm GENERATES from that exact autostart entry
+# (systemd-xdg-autostart-generator -> app-<escaped-name>@autostart.service),
+# and only when it is actually active. No pkill, no process hunting: an app the
+# user started by hand is not ours to kill, and stopping via systemd is a clean
+# cgroup SIGTERM rather than a blind signal.
+# $@ = names to match against the entry's Exec basename (as disable_autostart).
+#
+# Every systemd call goes through sdq() and is therefore BOUNDED. The user
+# manager can be mid-transaction (a session-envelope start, a package upgrade)
+# and a systemctl call will sit there waiting for it; `block` must never hang
+# behind that, so the stop is best-effort and says so when it could not happen.
+sdq() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 systemctl --user "$@"
+  else
+    systemctl --user "$@"
+  fi
+}
+
+stop_autostart_running() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  command -v systemd-escape >/dev/null 2>&1 || return 0
+  [ -d "$AUTOSTART_DIR" ] || return 0
+  for f in "$AUTOSTART_DIR"/*.desktop; do
+    [ -f "$f" ] || continue
+    ex=$(sed -n 's/^Exec=//p' "$f" | head -n1 | cut -d' ' -f1)
+    _bn=${ex##*/}
+    _hit=
+    for _want in "$@"; do
+      [ -n "$_want" ] && [ "$_bn" = "$_want" ] && _hit=1
+    done
+    [ -n "$_hit" ] || continue
+    _esc=$(systemd-escape "$(basename "$f" .desktop)" 2>/dev/null) || continue
+    [ -n "$_esc" ] || continue
+    _unit="app-${_esc}@autostart.service"
+    [ "$(sdq is-active "$_unit" 2>/dev/null)" = "active" ] || continue
+    if sdq stop "$_unit" >/dev/null 2>&1; then
+      echo "  → stopped running applet: $(basename "$f") (its tray/bar icon goes with it)"
+    else
+      echo "  ! could not stop $(basename "$f") (system manager busy?) — its tray icon may stay until it exits" >&2
+    fi
+  done
+  return 0
+}
+
 # Re-enable an autostart entry at unblock, MERGING rather than restoring:
 # only ever touch the Hidden key we may have patched, and leave every other
 # line (Exec, flags, etc.) exactly as the live file has it — an app update
@@ -552,16 +771,17 @@ restore_autostart() {
   done
 }
 
-# True if a menu would currently show $1 — i.e. a live desktop entry that is
-# NOT masked by our NoDisplay override (system source) and not renamed aside
-# (user-dir web-app/PWA source).
-desktop_visible() {
-  src=$(find_desktop_file "$1") || return 1
-  case "$src" in
-    "$DESKTOP_DIR"/*) grep -q '^NoDisplay=true' "$src" && return 1 ;;
-  esac
-  [ -f "$DESKTOP_DIR/$1.desktop" ] && grep -q '^NoDisplay=true' "$DESKTOP_DIR/$1.desktop" 2>/dev/null && return 1
-  return 0
+# True when menu-hiding for $1 is fully in force right now: the user-dir
+# web-app/PWA flow (renamed aside and not re-created), or our NoDisplay
+# override that is LIVE end-to-end — Exec still routed through the deny script
+# (launcher_masked). Drives reconcile's drift repair: anything less means the
+# launcher layer regressed and must be re-applied.
+desktop_hidden() {
+  if [ -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" ] \
+     && ! find_desktop_file "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  launcher_masked "$1"
 }
 
 # Re-apply hiding for everything still in the blocklist. Repairs drift:
@@ -587,6 +807,39 @@ heal_shims() {
       echo "  ↻ refreshed shim key for $a (${cur:-none} → $want)"
     fi
   done
+}
+
+# Finish the layers a lazy lift cannot reach. A lift that lands at LAUNCH (the
+# shim or the deny script, once a --until deadline or the unblock cooldown has
+# passed) clears the blocklist itself, and hand-editing blocked.list is the
+# documented escape hatch — neither goes through this program. So sweep any
+# artifact of OURS left behind for a key that is no longer blocked: an unblocked
+# app must never stay hidden, and a stale deny script is dead weight either way.
+cleanup_stale() {
+  _cs_keys=
+  for f in "$DESKTOP_DIR"/*.desktop \
+           "$DESKTOP_DIR"/.appblock-disabled.*.desktop.off \
+           "$SHIMS"/.appblock-deny.*; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    case "$b" in
+      .appblock-disabled.*.desktop.off) b=${b#.appblock-disabled.}; b=${b%.desktop.off} ;;
+      .appblock-deny.*)                 b=${b#.appblock-deny.} ;;
+      *.desktop)                        grep -q '^# appblock override' "$f" 2>/dev/null || continue
+                                        b=${b%.desktop} ;;
+      *) continue ;;
+    esac
+    [ -n "$b" ] || continue
+    _cs_keys="$_cs_keys $b"
+  done
+  for k in $_cs_keys; do
+    is_blocked "$k" && continue
+    _bk=$(shim_binary_for_key "$k" || :); _bk=${_bk:-$k}
+    echo "  ↻ finished cleanup for $k (it was lifted without an appblock run)"
+    unhide_desktop "$k"; restore_autostart "$_bk"; restore_desktop_icons "$k"
+    webapp_del "$k"; until_del "$k"
+  done
+  return 0
 }
 
 reconcile() {
@@ -638,7 +891,9 @@ reconcile() {
 
   grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
     [ -n "$app" ] || continue
-    if desktop_visible "$app"; then
+    if desktop_hidden "$app"; then
+      :
+    else
       hide_desktop "$app" && echo "  ↻ re-hid menu entry for $app (drift repaired)"
     fi
     hide_desktop_icons "$app"   # re-hides an icon recreated while blocked
@@ -653,7 +908,9 @@ reconcile() {
       done
     fi
   done
+  cleanup_stale
   refresh_webguard
+  refresh_denies
 }
 
 ensure_path() {
@@ -701,7 +958,76 @@ install_env() {
   echo "   now inherit PATH from the live manager (already updated)."
 }
 
-cmd="$1"; shift 2>/dev/null || { echo "usage: appblock block|unblock|toggle|list <app...>"; exit 2; }
+usage_main() {
+  cat <<'USAGE'
+usage: appblock block <app|url>... [--until <dur>] [--keep-running]
+       appblock unblock <app|url>... [--after <dur>|--cancel]
+       appblock toggle <app|url>...
+       appblock list [--json]                 # --json: stable machine-readable state
+       appblock shims | install | --version
+  --until 25m       block only until then, then lift by itself (25m, 2h, 1h30m, 22:30)
+  --after 30m       wait longer before a requested unblock lifts (default 10m)
+  --keep-running    blocking an applet that is already up stops it, and its
+                    tray/bar icon goes with it; this leaves the running applet alone
+USAGE
+}
+
+# Bare `appblock` must reach the usage text below, not die on `set -u`: under
+# `set -eu` a plain `$1` here aborted with "$1: unbound variable" before any
+# help was printed, so "what are the flags?" was unanswerable from the tool.
+cmd="${1:-}"
+[ -n "$cmd" ] && { shift 2>/dev/null || :; }
+
+# --- machine-readable state (`list --json`) -----------------------------------
+# One JSON document on stdout and NOTHING else: reconcile's chatter goes to
+# stderr in this mode, because a consumer (bar widget, script, plugin) parses
+# stdout. `schema` is the contract version for those consumers — bump it only
+# when the shape changes incompatibly.
+#
+# The consumer rule (why this command exists at all): consumers read THIS, never
+# `blocked.list`. Re-deriving "what is blocked" from the plaintext state in a
+# second language means two implementations of one truth, which is exactly the
+# class of bug this project keeps finding (a shim keyed differently from the
+# blocklist it checks). Timed-block deadlines and pending lifts are exported as
+# raw epochs — the authoritative value — alongside the *seconds* remaining, so a
+# widget can run a live countdown without re-implementing our parsing.
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+json_num_or_null() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf 'null'; fi; }
+
+list_json() {
+  _n=$(grep -c . "$STATE" 2>/dev/null || :); _n=${_n:-0}
+  printf '{\n'
+  printf '  "schema": %s,\n' "$JSON_SCHEMA"
+  printf '  "version": "%s",\n' "$VERSION"
+  printf '  "state_dir": %s,\n' "$(json_str "$BASE")"
+  printf '  "count": %s,\n' "$_n"
+  printf '  "blocked": ['
+  _jf=1
+  grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    _now=$(date +%s)
+    _u=$(list_epoch "$UNTIL" "$app"); _p=$(list_epoch "$UNBLOCK_AT" "$app")
+    _u_in=; _p_in=
+    if [ -n "$_u" ]; then _u_in=$(( _u - _now )); fi
+    if [ -n "$_p" ]; then _p_in=$(( _p - _now )); fi
+    [ "$_jf" -eq 1 ] || printf ','
+    _jf=0
+    printf '\n    {"id": %s, "enforcement": %s, "until": %s, "unblock_at": %s, "until_in": %s, "unblock_in": %s}' \
+      "$(json_str "$app")" "$(json_str "$(enforcement_label "$app")")" \
+      "$(json_num_or_null "$_u")" "$(json_num_or_null "$_p")" \
+      "$(json_num_or_null "$_u_in")" "$(json_num_or_null "$_p_in")"
+  done
+  printf '\n  ],\n'
+  printf '  "managed": ['
+  _jf=1
+  grep -vxF '' "$MANAGED" 2>/dev/null | while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    [ "$_jf" -eq 1 ] || printf ', '
+    _jf=0
+    json_str "$a"
+  done
+  printf ' ]\n}\n'
+}
 
 # True if $1 is launch-enforced RIGHT NOW (no block-time caching): the shim
 # exists AND either its recorded exec target is alive, or the binary is
@@ -712,28 +1038,46 @@ enforcement_label() {
     http://*|https://*)
       echo "web-app URL guard (keybind/launcher intercepted)"; return 0 ;;
   esac
+  _el_mask=
+  launcher_masked "$1" && _el_mask="launcher masked (by-id launch intercepted)"
   _el_shim=$(shim_for_key "$1") || _el_shim=
   if [ -n "$_el_shim" ]; then
     _el_bin=${_el_shim##*/}          # launch name: exec target / re-resolve name
     t=$(sed -n 's/^exec "\([^"]*\)" .*/\1/p' "$_el_shim")
     if [ -n "$t" ] && [ -x "$t" ]; then
-      echo "enforced"
+      _el_base=enforced
     elif [ -n "$(find_real "$_el_bin")" ]; then
-      echo "enforced (shim stale — refresh with 'appblock shims')"
+      _el_base="enforced (shim stale — refresh with 'appblock shims')"
     else
-      echo "hidden only — target gone (re-run 'appblock block $_el_bin' to refresh)"
+      _el_base="hidden only — target gone (re-run 'appblock block $_el_bin' to refresh)"
+    fi
+  elif [ -f "$DESKTOP_DIR/$1.desktop" ] && grep -q '^# appblock override' "$DESKTOP_DIR/$1.desktop" 2>/dev/null; then
+    # A live override whose Exec is NOT the deny path means a by-id launcher
+    # would fall through to the real system entry — say so, don't assume.
+    if launcher_masked "$1"; then
+      _el_base="launcher masked (by-id launch intercepted)"
+    else
+      _el_base="hidden only (menu entry hidden; by-id launch NOT intercepted — run 'appblock list' to repair)"
     fi
   elif [ -f "$DESKTOP_DIR/.appblock-disabled.$1.desktop.off" ]; then
     if webguarded "$1"; then
-      echo "menu hidden + omarchy-launch-webapp guard (keybind intercepted)"
+      _el_base="menu hidden + omarchy-launch-webapp guard (keybind intercepted)"
     else
-      echo "hidden only (menu entry hidden; direct launch NOT intercepted)"
+      _el_base="hidden only (menu entry hidden; direct launch NOT intercepted)"
     fi
   elif webguarded "$1"; then
-    echo "omarchy-launch-webapp guard (keybind intercepted)"
+    _el_base="omarchy-launch-webapp guard (keybind intercepted)"
   else
-    echo "not launch-enforced"
+    _el_base="not launch-enforced"
   fi
+  if [ -n "$_el_mask" ]; then
+    case "$_el_base" in
+      *"launcher masked"*) ;;                     # already that label
+      "not launch-enforced") _el_base=$_el_mask ;;
+      *) _el_base="$_el_base, $_el_mask" ;;
+    esac
+  fi
+  echo "$_el_base"
   return 0
 }
 
@@ -755,22 +1099,35 @@ case "$cmd" in
   block|unblock|toggle)
     [ $# -ge 1 ] || { echo "usage: appblock $cmd <app...>"; exit 2; }
     ensure_path
-    # Peel off --until <duration> (block deadline) and the friction knobs
-    # --after <duration> / --cancel (lift cooldown). They apply to every app/URL
-    # named in the same call.
+    # Peel off --until <duration> (block deadline), the friction knobs
+    # --after <duration> / --cancel (lift cooldown), and --keep-running
+    # (block without stopping an applet that is already up). They apply to every
+    # app/URL named in the same call.
+    #
+    # Non-flag words are ROTATED to the back of "$@" instead of being collected
+    # into a string and eval'd, so flags may appear anywhere (`block foo
+    # --until 25m` and `block --until 25m foo` both work) but every argument
+    # survives byte-exact. The old `eval "set -- $_args"` re-parsed each
+    # argument as shell SOURCE, which meant a URL with an `&` in it was
+    # truncated (and silently blocked nothing), one with a quote died with a
+    # syntax error, and one containing $( ) or backticks was EXECUTED —
+    # `block 'https://x/$(touch /tmp/pwned)'` really did run the touch.
     until_epoch=
     after_secs=
     cancel_pending=
-    _args=
-    while [ $# -gt 0 ]; do
+    keep_running=
+    _left=$#
+    while [ "$_left" -gt 0 ]; do
       case "$1" in
         --until)
           [ $# -ge 2 ] || { echo "  ! --until needs a duration (e.g. 25m, 2h, 1h30m)" >&2; exit 2; }
+          _left=$(( _left - 2 ))
           until_epoch=$(parse_duration_to_epoch "$2") \
             || { echo "  ! unparseable --until duration '$2'" >&2; exit 2; }
           shift 2 ;;
         --after)
           [ $# -ge 2 ] || { echo "  ! --after needs a duration (e.g. 10m, 1h)" >&2; exit 2; }
+          _left=$(( _left - 2 ))
           _t=$(parse_duration_to_epoch "$2") \
             || { echo "  ! unparseable --after duration '$2'" >&2; exit 2; }
           after_secs=$(( _t - $(date +%s) ))
@@ -778,16 +1135,23 @@ case "$cmd" in
             || { echo "  ! --after must be at least ${UNBLOCK_WAIT_MIN}s — that wait IS the feature; to lift a block now, edit $STATE" >&2; exit 2; }
           shift 2 ;;
         --cancel)
-          cancel_pending=1; shift ;;
-        *) _args="$_args $1"; shift ;;
+          cancel_pending=1; _left=$(( _left - 1 )); shift ;;
+        --keep-running)
+          keep_running=1; _left=$(( _left - 1 )); shift ;;
+        *)
+          _rotate=$1; shift; set -- "$@" "$_rotate"; _left=$(( _left - 1 )) ;;
       esac
     done
-    eval "set -- $_args"
     [ $# -ge 1 ] || { echo "usage: appblock $cmd <app...>"; exit 2; }
     if [ "$cmd" = "block" ] && { [ -n "$after_secs" ] || [ -n "$cancel_pending" ]; }; then
       echo "  ! --after/--cancel apply to unblock (and toggle); blocking is immediate" >&2; exit 2
     fi
-    [ -n "$after_secs" ] || after_secs=$UNBLOCK_WAIT_DEFAULT
+    if [ "$cmd" = "unblock" ] && [ -n "$keep_running" ]; then
+      echo "  ! --keep-running applies to blocking; lifting never starts or stops anything" >&2; exit 2
+    fi
+    # An explicit --after is a fresh instruction (counts from now, may shorten a
+    # pending wait); a bare unblock/toggle must never touch one already pending.
+    if [ -n "$after_secs" ]; then unblock_mode=extend; else after_secs=$UNBLOCK_WAIT_DEFAULT; unblock_mode=keep; fi
     for app in "$@"; do
       if [ "$app" = "appblock" ]; then
         echo "  ! won't block appblock itself"; continue
@@ -804,7 +1168,7 @@ case "$cmd" in
             unblock) if [ -n "$cancel_pending" ]; then
                        unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
                      elif is_blocked "$app" || unblock_pending "$app"; then
-                       unblock_add "$app" "$after_secs"; unblock_notice "$app"
+                       unblock_add "$app" "$after_secs" "$unblock_mode"; unblock_notice "$app"
                      else
                        echo "  ! $app is not blocked"
                      fi
@@ -813,7 +1177,7 @@ case "$cmd" in
                        if [ -n "$cancel_pending" ]; then
                          unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
                        else
-                         unblock_add "$app" "$after_secs"; unblock_notice "$app"
+                         unblock_add "$app" "$after_secs" "$unblock_mode"; unblock_notice "$app"
                        fi
                      else
                        echo "$app" >>"$STATE"; webapp_add "$app" "$(normalize_url "$app")"
@@ -841,7 +1205,7 @@ case "$cmd" in
           if [ -n "$cancel_pending" ]; then
             unblock_del "$app"; echo "🚫 $app stays blocked — pending unblock cancelled"
           elif is_blocked "$app" || unblock_pending "$app"; then
-            unblock_add "$app" "$after_secs"; unblock_notice "$app"
+            unblock_add "$app" "$after_secs" "$unblock_mode"; unblock_notice "$app"
           else
             echo "  ! $app is not blocked"
           fi
@@ -854,12 +1218,16 @@ case "$cmd" in
       wurl=$(webapp_url "$entry" 2>/dev/null || true)   # web-app? record its URL
       case "$cmd" in
         block)   is_blocked "$entry" || echo "$entry" >>"$STATE";  hide_desktop "$id"; disable_autostart "$app"
+                 # A disabled autostart entry only takes effect next login; the
+                 # applet already up keeps its tray icon. Stop it (unless the
+                 # user asked to keep it) so blocking the app really removes it.
+                 [ -n "$keep_running" ] || stop_autostart_running "$app" "$(shim_binary_for_key "$entry" || :)"
                  webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"; until_add "$entry" "$until_epoch"
                  echo "🚫 $entry blocked" ;;
         unblock) if [ -n "$cancel_pending" ]; then
                    unblock_del "$entry"; echo "🚫 $entry stays blocked — pending unblock cancelled"
                  elif is_blocked "$entry" || unblock_pending "$entry"; then
-                   unblock_add "$entry" "$after_secs"; unblock_notice "$entry"
+                   unblock_add "$entry" "$after_secs" "$unblock_mode"; unblock_notice "$entry"
                  else
                    echo "  ! $entry is not blocked"
                  fi ;;
@@ -867,10 +1235,11 @@ case "$cmd" in
                    if [ -n "$cancel_pending" ]; then
                      unblock_del "$entry"; echo "🚫 $entry stays blocked — pending unblock cancelled"
                    else
-                     unblock_add "$entry" "$after_secs"; unblock_notice "$entry"
+                     unblock_add "$entry" "$after_secs" "$unblock_mode"; unblock_notice "$entry"
                    fi
                  else
                    echo "$entry" >>"$STATE"; hide_desktop "$id"; disable_autostart "$app"
+                   [ -n "$keep_running" ] || stop_autostart_running "$app" "$(shim_binary_for_key "$entry" || :)"
                    webapp_add "$entry" "$(normalize_url "${wurl:-}")"; hide_desktop_icons "$entry"
                    until_add "$entry" "$until_epoch"; echo "🚫 $entry blocked"
                  fi ;;
@@ -887,22 +1256,33 @@ case "$cmd" in
     echo "ℹ️  open shells may have the old path cached — run 'hash -r' in them (new terminals pick it up instantly)"
     ;;
   list)
-    reconcile
-    echo "Blocked apps:"
-    n=$(grep -c . "$STATE" 2>/dev/null || :); n=${n:-0}
-    [ "$n" -eq 0 ] && echo "  (none)"
-    grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
-      [ -n "$app" ] || continue
-      _u=$(until_remaining "$app"); _p=$(unblock_remaining "$app")
-      echo "  🚫 $app — $(enforcement_label "$app")${_u:+" ($_u)"}${_p:+" (unblocks in $_p)"}"
-    done
-    echo "Managed apps (add more: appblock block <app>):"
-    grep -vxF '' "$MANAGED" 2>/dev/null | sed 's/^/  - /' || echo "  (none)"
-    ;;
+    case "${1:-}" in
+      --json)
+        # reconcile first (state must be current), but its narration goes to
+        # stderr: stdout is a JSON document and nothing else.
+        reconcile >&2
+        list_json ;;
+      "")
+        reconcile
+        echo "Blocked apps:"
+        n=$(grep -c . "$STATE" 2>/dev/null || :); n=${n:-0}
+        [ "$n" -eq 0 ] && echo "  (none)"
+        grep -vxF '' "$STATE" 2>/dev/null | while IFS= read -r app; do
+          [ -n "$app" ] || continue
+          _u=$(until_remaining "$app"); _p=$(unblock_remaining "$app"); _at=$(unblock_at_time "$app")
+          echo "  🚫 $app — $(enforcement_label "$app")${_u:+ ($_u)}${_p:+ (unblocks in $_p, at $_at)}"
+        done
+        echo "Managed apps (add more: appblock block <app>):"
+        grep -vxF '' "$MANAGED" 2>/dev/null | sed 's/^/  - /' || echo "  (none)" ;;
+      *)
+        echo "  ! unknown option for list: $1 (only --json)" >&2; exit 2 ;;
+    esac ;;
   shims) while read -r a; do
            [ -n "$a" ] || continue
            install_shim "$a" || echo "  ! could not (re)install shim for '$a' (binary not on PATH?)" >&2
          done <"$MANAGED"; refresh_webguard; echo "shims refreshed" ;;
   install) install_env ;;
-  *) echo "usage: appblock block|unblock|toggle|list|shims|install"; exit 2 ;;
+  --version|-v) echo "appblock $VERSION" ;;
+  --help|-h|help) usage_main ;;
+  *) usage_main; exit 2 ;;
 esac

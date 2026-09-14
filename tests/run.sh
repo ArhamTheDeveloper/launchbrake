@@ -1,19 +1,23 @@
 #!/bin/sh
 # appblock smoke test suite.
 # Runs entirely inside a sandboxed $HOME — real config, state, and systemd
-# are NEVER touched. Requires only POSIX sh + coreutils.
+# are NEVER touched. Requires only POSIX sh + coreutils; the by-id click-through
+# section additionally exercises the real `gtk-launch` (gtk3 ships on Omarchy)
+# against the sandboxed XDG tree and is skipped loudly if it is absent.
 #
 # Usage: sh tests/run.sh   (from the repo root)
 
 set -u
 fail=0
 pass=0
+skipped=0
 AB="$(cd "$(dirname "$0")/.." && pwd)/bin/appblock"
 AB="$(readlink -f "$AB" 2>/dev/null || echo "$AB")"
 
 section() { printf '\n== %s ==\n' "$1"; }
 ok()   { pass=$((pass+1)); printf '   ok:   %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '   FAIL: %s\n' "$1"; }
+skip() { skipped=$((skipped+1)); printf '   SKIP: %s\n' "$1"; }
 check() { # check <msg> <cmd...> — runs cmd, drops msg from the arg list
   msg=$1; shift
   if "$@" >/dev/null 2>&1; then ok "$msg"; else bad "$msg"; fi
@@ -62,7 +66,24 @@ printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin/demoapp\n' 
 printf '[Desktop Entry]\nType=Application\nName=demoapp\nExec=%s/bin/demoapp\n' "$HOME" \
   >"$HOME/.config/autostart/demoapp.desktop"
 
-export PATH="$HOME/.local/share/appblock/shims:$HOME/bin:$PATH"
+# The suite's contract is that real config, state, and systemd are NEVER
+# touched. appblock stops a running applet through the systemd unit generated
+# from the autostart entry it just disabled, so a test run would otherwise poke
+# the LIVE user manager — and a real systemctl that happens to be waiting on a
+# busy manager turns a fast suite into a stalling one. Stub it out; the applet
+# section below overrides this with its own fake to assert the "active" path.
+mkdir -p "$HOME/stub"
+cat >"$HOME/stub/systemctl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$HOME/stub/systemctl.calls"
+case "$1 $2" in
+  "--user is-active") echo inactive; exit 3 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$HOME/stub/systemctl"
+
+export PATH="$HOME/.local/share/appblock/shims:$HOME/stub:$HOME/bin:$PATH"
 
 section "block / run-guard / unblock"
 "$AB" block demoapp >/dev/null 2>&1 && ok "block demoapp" || bad "block demoapp"
@@ -89,12 +110,130 @@ section "enforcement label"
 section "desktop override (masks absolute Exec)"
 check "menu override written (NoDisplay=true)" \
   grep -q '^NoDisplay=true' "$HOME/.local/share/applications/demoapp.desktop"
-check "override uses bare Exec (masks the absolute original)" \
-  grep -q '^Exec=demoapp$' "$HOME/.local/share/applications/demoapp.desktop"
+check "override Exec is the absolute deny path — never the raw id" \
+  grep -qF "Exec=$HOME/.local/share/appblock/shims/.appblock-deny.demoapp" \
+    "$HOME/.local/share/applications/demoapp.desktop"
+check "NoDisplay=true alone is never asserted as the gate (Exec is checked too)" \
+  grep -q '^# appblock override' "$HOME/.local/share/applications/demoapp.desktop"
+check "deny script generated for the blocked app" \
+  test -x "$HOME/.local/share/appblock/shims/.appblock-deny.demoapp"
 check "original absolute-Exec entry untouched" \
   grep -q '^Exec=.*bin/demoapp$' "$HOME/.local/share/flatpak/exports/share/applications/demoapp.desktop"
+check "anti-gotcha: fixture id has no real-system twin (resolve stays in the sandbox)" \
+  sh -c '! test -f /usr/share/applications/demoapp.desktop -o -f /usr/local/share/applications/demoapp.desktop'
 
-section "autostart disable + drift repair + merge-unblock"
+section "by-id .desktop click-through (gtk-launch; NoDisplay=true is NOT enforcement)"
+# Omarchy's launcher/dock/taskbar launches apps the way gtk-launch does:
+# resolve the desktop id against the data dirs and run whatever Exec the
+# overriding user-dir entry carries. Two hard facts verified live:
+#   (1) NoDisplay=true does NOT stop a by-id launch — GLib still runs the Exec;
+#   (2) if that Exec cannot SPAWN (the old Exec=<id> shape for reverse-DNS
+#       ids), gtk-launch silently falls through to the real system entry and
+#       the blocked app launches.
+# So the override Exec must be an absolute deny-script path for EVERY app, and
+# this section executes the REAL gtk-launch with HOME/XDG sandboxed so no real
+# system state is consulted.
+if command -v gtk-launch >/dev/null 2>&1; then
+  GLAUNCH() {
+    XDG_DATA_HOME="$HOME/.local/share" \
+    XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/usr/local/share:/usr/share" \
+    XDG_CONFIG_HOME="$HOME/.config" \
+      gtk-launch "$@"
+  }
+
+  # same-name fixture (id == binary): the shape that used to work only by luck
+  check "same-name override Exec is the absolute deny path (never the raw id)" \
+    grep -qF "Exec=$HOME/.local/share/appblock/shims/.appblock-deny.demoapp" \
+      "$HOME/.local/share/applications/demoapp.desktop"
+  if GLAUNCH demoapp.desktop 2>/dev/null | grep -q hi-from-demoapp; then
+    bad "same-name by-id click launched the blocked app"
+  else
+    ok "same-name by-id click refused (deterministic deny path, not the raw-id accident)"
+  fi
+
+  # reverse-DNS fixture: id != binary name — the shape that silently fell
+  # through. The fixture name is unique so resolve_desktop_id cannot match a
+  # real /usr/share entry from inside the sandbox (known suite gotcha).
+  printf '#!/bin/sh\necho REVDNS-CLICKED\n' >"$HOME/bin/revguardapp"
+  chmod +x "$HOME/bin/revguardapp"
+  printf '[Desktop Entry]\nType=Application\nName=RevGuardApp\nExec=%s/bin/revguardapp\n' "$HOME" \
+    >"$HOME/.local/share/flatpak/exports/share/applications/org.example.revguard.desktop"
+  "$AB" block revguardapp >/dev/null 2>&1
+  check "revdns fixture blocked under its canonical id (not the typed name)" \
+    grep -qxF org.example.revguard "$HOME/.local/share/appblock/blocked.list"
+  check "revdns override Exec is the absolute deny path — never the raw id" \
+    grep -qF "Exec=$HOME/.local/share/appblock/shims/.appblock-deny.org.example.revguard" \
+      "$HOME/.local/share/applications/org.example.revguard.desktop"
+  check_not "revdns override does NOT carry the raw id as Exec (the old shape)" \
+    grep -q '^Exec=org.example.revguard$' \
+      "$HOME/.local/share/applications/org.example.revguard.desktop"
+  if GLAUNCH org.example.revguard.desktop 2>/dev/null | grep -q REVDNS-CLICKED; then
+    bad "reverse-DNS by-id click launched the blocked app (fall-through)"
+  else
+    ok "reverse-DNS by-id click refused (fall-through closed)"
+  fi
+  "$AB" list 2>&1 | grep -q 'org.example.revguard — enforced, launcher masked (by-id launch intercepted)' \
+    && ok "list reports the verified by-id interception label" \
+    || bad "list did not report by-id interception for the revdns app"
+
+  # Specific regression: NoDisplay=true alone must NEVER be treated as
+  # sufficient. Rewrite the override with the raw id as Exec (NoDisplay still
+  # true, marker still present): the click must fall through and run the app.
+  # Only reconcile's Exec re-assertion restores interception.
+  printf '[Desktop Entry]\n# appblock override — do not edit\nType=Application\nName=org.example.revguard\nNoDisplay=true\nExec=org.example.revguard\n' \
+    >"$HOME/.local/share/applications/org.example.revguard.desktop"
+  if GLAUNCH org.example.revguard.desktop 2>/dev/null | grep -q REVDNS-CLICKED; then
+    ok "bug shape reproduced: NoDisplay=true + raw-id Exec does NOT stop a by-id click"
+  else
+    bad "raw-id Exec did not fall through — the click-through harness is not real?"
+  fi
+  "$AB" list >/dev/null 2>&1   # reconcile re-asserts the deny Exec
+  check "reconcile re-pointed the clobbered override Exec at the deny path" \
+    grep -qF "Exec=$HOME/.local/share/appblock/shims/.appblock-deny.org.example.revguard" \
+      "$HOME/.local/share/applications/org.example.revguard.desktop"
+  if GLAUNCH org.example.revguard.desktop 2>/dev/null | grep -q REVDNS-CLICKED; then
+    bad "blocked app launched again after reconcile repair"
+  else
+    ok "by-id click refused again after reconcile repair (drift self-healed)"
+  fi
+
+  # Lazy-expiry parity: a passed --until deadline lifts AT LAUNCH through the
+  # deny script (same emitted block as the shim) and opens the app — a by-id
+  # click is never lost on the timed path either.
+  PASTGT=$(( $(date +%s) - 10 ))
+  echo "org.example.revguard|$PASTGT" >>"$HOME/.local/share/appblock/blocked-until.list"
+  [ "$(GLAUNCH org.example.revguard.desktop 2>/dev/null)" = "REVDNS-CLICKED" ] \
+    && ok "by-id click lifts an expired timed block and runs the app (lazy parity)" \
+    || bad "by-id click did not lift the expired timed block"
+  check_not "lazy by-id lift cleared blocked.list for the revdns app" \
+    grep -qxF org.example.revguard "$HOME/.local/share/appblock/blocked.list"
+
+  # Drift repair on this surface: a deleted deny script (config regenerated /
+  # re-pinned elsewhere) is re-created by the next invocation, no user action.
+  "$AB" block revguardapp >/dev/null 2>&1
+  rm -f "$HOME/.local/share/appblock/shims/.appblock-deny.org.example.revguard"
+  "$AB" list >/dev/null 2>&1
+  check "reconcile re-created a deleted deny script (drift self-heal)" \
+    test -x "$HOME/.local/share/appblock/shims/.appblock-deny.org.example.revguard"
+
+  # unblock: override + deny removed, original entry untouched (byte-exact restore)
+  ab_unblock_now revguardapp >/dev/null 2>&1
+  check "unblock removed the override (original system entry untouched)" \
+    test ! -e "$HOME/.local/share/applications/org.example.revguard.desktop"
+  check "unblock removed the deny script" \
+    test ! -e "$HOME/.local/share/appblock/shims/.appblock-deny.org.example.revguard"
+  [ "$(GLAUNCH org.example.revguard.desktop 2>/dev/null)" = "REVDNS-CLICKED" ] \
+    && ok "unblocked by-id click runs the real entry (harness + restore verified)" \
+    || bad "unblocked by-id click did not run (harness broken or restore wrong)"
+
+  ab_unblock_now demoapp >/dev/null 2>&1
+  [ "$(GLAUNCH demoapp.desktop 2>/dev/null)" = "hi-from-demoapp" ] \
+    && ok "same-name by-id click runs after unblock (harness verified)" \
+    || bad "same-name by-id click did not run after unblock"
+  "$AB" block demoapp >/dev/null 2>&1   # next section expects demoapp blocked
+else
+  skip "gtk-launch not installed — by-id click-through regression not exercised (install gtk3: omarchy ships it)"
+fi
 check "autostart entry disabled (Hidden=true)" \
   grep -q '^Hidden=true' "$HOME/.config/autostart/demoapp.desktop"
 # app update rewrites the autostart file: changes Exec to a new path, drops Hidden
@@ -475,6 +614,39 @@ check_not "friction: lazy launch lift cleared blocked.list" grep -qxF fricapp \
 check "friction: lazy launch lift cleared the pending entry" test ! -s \
   "$HOME/.local/share/appblock/unblock-at.list"
 
+# Retrying must not push the wait out. Re-arming the whole cooldown from "now"
+# on every request (the old behaviour) made the natural "it still hasn't
+# unblocked, ask again" response the one thing that could postpone the lift for
+# as long as the user kept asking — i.e. the wait never ended.
+"$AB" block fricapp >/dev/null 2>&1
+"$AB" unblock fricapp >/dev/null 2>&1
+first=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+sleep 2
+"$AB" unblock fricapp 2>&1 | grep -q 'already has a lift scheduled' \
+  && ok "friction: a retry reports the lift is already scheduled" \
+  || bad "friction: retry did not admit the lift was already scheduled"
+second=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+[ "$first" = "$second" ] && ok "friction: a retry did NOT push the lift later" \
+  || bad "friction: retry moved the deadline ($first -> $second)"
+# --after is an explicit instruction, so it DOES count from now — including
+# shortening a wait the user is no longer willing to sit through.
+NOWF=$(date +%s)
+"$AB" unblock fricapp --after 2m >/dev/null 2>&1
+ep=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+[ -n "$ep" ] && [ "$ep" -ge $((NOWF + 115)) ] && [ "$ep" -le $((NOWF + 125)) ] \
+  && ok "friction: explicit --after re-sets the wait from now" \
+  || bad "friction: explicit --after ignored ($ep)"
+"$AB" unblock fricapp >/dev/null 2>&1
+ep2=$(sed -n 's/^fricapp|//p' "$HOME/.local/share/appblock/unblock-at.list" | tail -1)
+[ "$ep" = "$ep2" ] && ok "friction: a retry never shortens an explicit --after either" \
+  || bad "friction: retry changed an explicit --after wait ($ep -> $ep2)"
+# "When does it actually lift?" must be answerable without guessing: name the
+# clock time (a bare "another 10m" next to a "--after 30m" hint is what read as
+# "my block now lasts 30 minutes").
+"$AB" list 2>&1 | grep -q 'unblocks in .* at [0-9][0-9]:[0-9][0-9]' \
+  && ok "friction: list names the exact lift time" || bad "friction: list omits the lift time"
+"$AB" unblock fricapp --cancel >/dev/null 2>&1   # fixture back to a plain block
+
 # A `--until` deadline passing is AUTOMATIC and must stay frictionless — it is
 # not a user-requested lift, so no cooldown may apply to it.
 "$AB" block fricapp --until 1s >/dev/null 2>&1
@@ -484,6 +656,305 @@ check_not "friction: timed deadline lifts with no cooldown" grep -qxF fricapp \
   "$HOME/.local/share/appblock/blocked.list"
 check "friction: timed lift left no pending entry" test ! -s \
   "$HOME/.local/share/appblock/unblock-at.list"
+
+section "lazy lifts finish the job (menu layer + orphaned artifacts)"
+# A lift that lands AT LAUNCH clears the blocklist from inside the shim or deny
+# script — no appblock command runs, so reconcile() never sees that key again.
+# Whatever we masked has to be unmasked by the lifting script itself, or the app
+# launches but stays invisible in every menu/launcher, permanently.
+"$AB" block fricapp >/dev/null 2>&1
+"$AB" unblock fricapp >/dev/null 2>&1
+sed -i 's/|[0-9]*$/|1/' "$HOME/.local/share/appblock/unblock-at.list"   # age the wait
+[ "$(fricapp 2>/dev/null)" = "FRIC-RAN" ] && ok "lazy lift: app launches" \
+  || bad "lazy lift: app did not launch"
+check "lazy lift restored the renamed-aside menu entry" test -f \
+  "$HOME/.local/share/applications/fricapp.desktop"
+check "lazy lift left no masked residue" test ! -e \
+  "$HOME/.local/share/applications/.appblock-disabled.fricapp.desktop.off"
+
+# Same for the packaged-app shape (entry outside the user dir → NoDisplay
+# override + deny script): both of OUR files must go, and the app's own entry
+# must be untouched so the app is back in the menu.
+printf '#!/bin/sh\necho LAZY-RAN\n' >"$HOME/bin/lazyapp"
+chmod +x "$HOME/bin/lazyapp"
+printf '[Desktop Entry]\nType=Application\nName=lazyapp\nExec=%s/bin/lazyapp\n' "$HOME" \
+  >"$HOME/.local/share/flatpak/exports/share/applications/lazyapp.desktop"
+"$AB" block lazyapp >/dev/null 2>&1
+check "lazy: packaged-shape override written" test -f \
+  "$HOME/.local/share/applications/lazyapp.desktop"
+check "lazy: deny script written" test -x \
+  "$HOME/.local/share/appblock/shims/.appblock-deny.lazyapp"
+"$AB" unblock lazyapp >/dev/null 2>&1
+sed -i 's/|[0-9]*$/|1/' "$HOME/.local/share/appblock/unblock-at.list"
+[ "$(lazyapp 2>/dev/null)" = "LAZY-RAN" ] && ok "lazy: packaged-shape app launches" \
+  || bad "lazy: packaged-shape app did not launch"
+check "lazy: override removed (entry visible again)" test ! -e \
+  "$HOME/.local/share/applications/lazyapp.desktop"
+check "lazy: deny script removed" test ! -e \
+  "$HOME/.local/share/appblock/shims/.appblock-deny.lazyapp"
+check "lazy: original packaged entry never modified" grep -q '^Exec=.*bin/lazyapp$' \
+  "$HOME/.local/share/flatpak/exports/share/applications/lazyapp.desktop"
+
+# The documented escape hatch is editing blocked.list by hand; that never runs
+# this program at all, so the layers keyed on the launch binary (autostart,
+# desktop icons) can only be swept up by the next invocation.
+printf '#!/bin/sh\necho SWEEP-RAN\n' >"$HOME/bin/sweepapp"
+chmod +x "$HOME/bin/sweepapp"
+printf '[Desktop Entry]\nType=Application\nName=sweepapp\nExec=%s/bin/sweepapp\n' "$HOME" \
+  >"$HOME/.local/share/flatpak/exports/share/applications/sweepapp.desktop"
+printf '[Desktop Entry]\nType=Application\nName=sweepapp\nExec=%s/bin/sweepapp\n' "$HOME" \
+  >"$HOME/.config/autostart/sweepapp.desktop"
+"$AB" block sweepapp >/dev/null 2>&1
+check "sweep: autostart disabled while blocked" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/sweepapp.desktop"
+grep -vxF sweepapp "$HOME/.local/share/appblock/blocked.list" \
+  >"$HOME/.local/share/appblock/blocked.list.tmp" || :
+mv -f "$HOME/.local/share/appblock/blocked.list.tmp" "$HOME/.local/share/appblock/blocked.list"
+"$AB" list >/dev/null 2>&1
+check "sweep: orphaned menu override removed" test ! -e \
+  "$HOME/.local/share/applications/sweepapp.desktop"
+check "sweep: orphaned deny script removed" test ! -e \
+  "$HOME/.local/share/appblock/shims/.appblock-deny.sweepapp"
+check_not "sweep: autostart re-enabled (not left Hidden)" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/sweepapp.desktop"
+[ "$(sweepapp 2>/dev/null)" = "SWEEP-RAN" ] && ok "sweep: app runs and is back in the menu" \
+  || bad "sweep: app still refuses to run"
+rm -f "$HOME/.local/share/applications/lazyapp.desktop" \
+      "$HOME/.local/share/applications/sweepapp.desktop" \
+      "$HOME/.config/autostart/sweepapp.desktop"
+
+# Discoverability: timed blocks and the running-applet opt-out are flags, not
+# mysteries.
+"$AB" bogus 2>&1 | grep -q -- '--until' \
+  && ok "usage surfaces --until (block until a time)" || bad "usage hides --until"
+# Bare `appblock` used to abort on `set -u` ($1 unbound) before printing help.
+if "$AB" 2>&1 | grep -q 'unbound variable'; then
+  bad "bare 'appblock' died instead of printing usage (set -u on \$1)"
+else
+  ok "bare 'appblock' prints usage (no set -u crash)"
+fi
+"$AB" bogus 2>&1 | grep -q -- '--keep-running' \
+  && ok "usage surfaces --keep-running" || bad "usage hides --keep-running"
+
+section "blocking a running applet (autostart entry + its tray icon)"
+# A tray applet (Remmina's -i, Discord, Dropbox, …) is a LIVE process, and the
+# icon on the omarchy bar / waybar / any StatusNotifierItem host belongs to that
+# process. Disabling the autostart entry only stops the NEXT login, so blocking
+# an applet that is already up must stop it too, or the icon the user is looking
+# at survives the block. appblock touches ONLY the systemd unit generated from
+# the very autostart entry it just disabled — never a blind pkill — which is why
+# a fake systemctl is enough to observe the whole decision.
+if command -v systemd-escape >/dev/null 2>&1; then
+  printf '#!/bin/sh\necho TRAY-RAN\n' >"$HOME/bin/trayapp"
+  chmod +x "$HOME/bin/trayapp"
+  printf '[Desktop Entry]\nVersion=1.0\nName=trayapp Applet\nExec=trayapp -i\nType=Application\nHidden=false\n' \
+    >"$HOME/.config/autostart/trayapp-applet.desktop"
+  mkdir -p "$HOME/fakebin"
+  cat >"$HOME/fakebin/systemctl" <<'FAKE'
+#!/bin/sh
+# fake systemctl: logs every call, answers for exactly one generated unit
+printf '%s\n' "$*" >>"$HOME/fakebin/calls.log"
+case "$1 $2" in
+  "--user is-active")
+    [ "$3" = 'app-trayapp\x2dapplet@autostart.service' ] && { echo active; exit 0; }
+    echo inactive; exit 3 ;;
+  "--user stop") exit 0 ;;
+  *) exit 0 ;;
+esac
+FAKE
+  chmod +x "$HOME/fakebin/systemctl"
+
+  # --keep-running: the entry is still disabled, but a running applet is spared
+  : >"$HOME/fakebin/calls.log"
+  PATH="$HOME/fakebin:$PATH" "$AB" block trayapp --keep-running >/dev/null 2>&1
+  check "applet: --keep-running still disables the autostart entry" \
+    grep -q '^Hidden=true' "$HOME/.config/autostart/trayapp-applet.desktop"
+  check "applet: --keep-running made no systemd call at all" \
+    test ! -s "$HOME/fakebin/calls.log"
+
+  ab_unblock_now trayapp >/dev/null 2>&1
+  check_not "applet: lifting a block never (re)starts the app" \
+    grep -qF -- '--user start' "$HOME/fakebin/calls.log"
+  : >"$HOME/fakebin/calls.log"
+
+  # default: the applet started from that entry is stopped, by unit name
+  PATH="$HOME/fakebin:$PATH" "$AB" block trayapp >"$HOME/fakebin/out.log" 2>&1
+  check "applet: autostart entry disabled" grep -q '^Hidden=true' \
+    "$HOME/.config/autostart/trayapp-applet.desktop"
+  check "applet: asked about the unit generated from THAT entry" grep -qF -- \
+    '--user is-active app-trayapp\x2dapplet@autostart.service' "$HOME/fakebin/calls.log"
+  check "applet: stopped exactly that unit (tray icon goes with it)" grep -qF -- \
+    '--user stop app-trayapp\x2dapplet@autostart.service' "$HOME/fakebin/calls.log"
+  grep -q 'stopped running applet' "$HOME/fakebin/out.log" \
+    && ok "applet: the stop is reported, never silent" || bad "applet: stop not reported"
+  check "applet: exactly one unit stopped (no process spray)" \
+    test "$(grep -cF -- '--user stop' "$HOME/fakebin/calls.log")" = "1"
+
+  # The suite's own contract: nothing here may talk to the LIVE systemd user
+  # manager. The stub having been used is the proof that the real one was not.
+  check "applet: every systemd call went to the sandbox stub, not the live manager" \
+    test -s "$HOME/stub/systemctl.calls"
+
+  "$AB" unblock trayapp --keep-running >/dev/null 2>&1; kr_fail=$?
+  check "applet: --keep-running refused with unblock" [ "$kr_fail" -ne 0 ]
+  ab_unblock_now trayapp >/dev/null 2>&1
+  check "applet: unblock cleared the autostart Hidden flag" \
+    test "$(grep -c '^Hidden=true' "$HOME/.config/autostart/trayapp-applet.desktop" || :)" = "0"
+  rm -f "$HOME/.config/autostart/trayapp-applet.desktop" "$HOME/bin/trayapp"
+else
+  skip "systemd-escape absent — running-applet stop path not exercised"
+fi
+
+section "argument handling (no eval of user input)"
+# The parser used to collect the non-flag words into a string and then eval
+# "set -- $_args" it, which re-parsed every argument as shell SOURCE:
+#   * a URL with a query string (?a=1&b=2) was truncated at the & and blocked
+#     nothing at all — silently;
+#   * a name or URL containing a quote died with a syntax error;
+#   * one containing a command substitution or backticks was EXECUTED.
+# Arguments must survive byte-exact, and must never be evaluated.
+pwn="$HOME/PWNED-BY-ARGS"
+"$AB" block "https://x.example/?a=1&b=2" >/dev/null 2>&1
+check "args: a URL with a query string is stored byte-exact" grep -qxF \
+  'https://x.example/?a=1&b=2' "$HOME/.local/share/appblock/blocked.list"
+"$AB" block "https://y.example/\$(touch $pwn)" >/dev/null 2>&1
+check "args: a command substitution is NOT executed" test ! -e "$pwn"
+check "args: ...it is stored literally instead" grep -qxF \
+  "https://y.example/\$(touch $pwn)" "$HOME/.local/share/appblock/blocked.list"
+"$AB" block 'https://z.example/a"b' >/dev/null 2>&1
+check "args: a quote in an argument is stored byte-exact" grep -qxF \
+  'https://z.example/a"b' "$HOME/.local/share/appblock/blocked.list"
+# Flags keep working on either side of the app names.
+"$AB" block fricapp --until 17m >/dev/null 2>&1
+check "args: a flag AFTER the app name is parsed" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+ab_unblock_now fricapp >/dev/null 2>&1
+"$AB" block --until 17m fricapp >/dev/null 2>&1
+check "args: a flag BEFORE the app name is parsed" grep -qxF fricapp \
+  "$HOME/.local/share/appblock/blocked.list"
+check "args: ...and the flag took effect (deadline recorded)" grep -q '^fricapp|' \
+  "$HOME/.local/share/appblock/blocked-until.list"
+ab_unblock_now fricapp >/dev/null 2>&1
+ab_unblock_now "https://x.example/?a=1&b=2" "https://y.example/\$(touch $pwn)" 'https://z.example/a"b' >/dev/null 2>&1
+check "args: fixtures cleaned up" test ! -s "$HOME/.local/share/appblock/blocked.list"
+
+section "machine-readable state (list --json)"
+# The contract a bar widget / plugin consumes. The point is that a consumer
+# never re-derives blocked state from the plaintext files in another language:
+# it reads this document. So it must ALWAYS be valid JSON on stdout, with no
+# narration mixed in — reconcile's chatter has to go to stderr even when the
+# call itself lifts a block.
+printf '#!/bin/sh\necho JSONAPP-RAN\n' >"$HOME/bin/jsonapp"
+chmod +x "$HOME/bin/jsonapp"
+# Capture the clock BEFORE and AFTER the blocking, so the deadline can be
+# asserted tightly (now+20m) without assuming the suite runs fast.
+NOWB=$(date +%s)
+"$AB" block jsonapp --until 20m >/dev/null 2>&1
+"$AB" block 'https://example.com/a"b' >/dev/null 2>&1   # an id needing JSON escaping
+NOWJ=$(date +%s)
+out=$("$AB" list --json 2>/dev/null)
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin)' \
+    && ok "json: output parses as real JSON" || bad "json: output is not valid JSON"
+else
+  skip "python3 absent — JSON checked structurally only"
+fi
+printf '%s' "$out" | grep -q '"schema": 1' && ok "json: carries the schema version" \
+  || bad "json: schema field missing"
+printf '%s' "$out" | grep -q '"blocked": \[' && ok "json: blocked array present" \
+  || bad "json: blocked array missing"
+printf '%s' "$out" | grep -q '"managed": \[' && ok "json: managed array present" \
+  || bad "json: managed array missing"
+check "json: count matches the blocklist" \
+  test "$(printf '%s' "$out" | sed -n 's/.*"count": \([0-9]*\).*/\1/p')" = "$(grep -c . "$HOME/.local/share/appblock/blocked.list")"
+# A timed block exports the authoritative epoch AND the seconds remaining, so a
+# widget runs a live countdown instead of re-implementing our parsing.
+printf '%s' "$out" | grep -q '"id": "jsonapp"' && ok "json: blocked app listed by canonical id" \
+  || bad "json: blocked app missing"
+# A timed block exports the AUTHORITATIVE epoch plus the seconds remaining, so a
+# widget runs a live countdown instead of re-implementing our parsing. Asserting
+# the RELATIONSHIP (until - until_in == now) rather than a wall-clock window
+# keeps this honest even when the suite runs slowly.
+_jline=$(printf '%s' "$out" | grep -F '"id": "jsonapp"' | head -n1)
+jq_until=$(printf '%s' "$_jline" | sed -n 's/.*"until": \([0-9]*\).*/\1/p')
+jq_uin=$(printf '%s' "$_jline" | sed -n 's/.*"until_in": \([0-9]*\).*/\1/p')
+if [ -n "$jq_until" ] && [ "$jq_until" -ge $((NOWB + 1195)) ] && [ "$jq_until" -le $((NOWJ + 1205)) ]; then
+  ok "json: timed block exports its deadline epoch (now+20m)"
+else
+  bad "json: until epoch wrong ($jq_until, wanted $((NOWB + 1200))..$((NOWJ + 1200)))"
+fi
+if [ -n "$jq_uin" ] && [ "$jq_uin" -le 1200 ] \
+   && [ "$(( jq_until - jq_uin - $(date +%s) ))" -ge -3 ] \
+   && [ "$(( jq_until - jq_uin - $(date +%s) ))" -le 3 ]; then
+  ok "json: until_in is derived from that epoch at call time"
+else
+  bad "json: until_in inconsistent with the epoch ($jq_uin)"
+fi
+
+# A pending lift is exported the same way (the field a bar renders as a timer).
+NOWU=$(date +%s)
+"$AB" unblock jsonapp >/dev/null 2>&1
+out2=$("$AB" list --json 2>/dev/null)
+_jline2=$(printf '%s' "$out2" | grep -F '"id": "jsonapp"' | head -n1)
+jq_up=$(printf '%s' "$_jline2" | sed -n 's/.*"unblock_at": \([0-9]*\).*/\1/p')
+jq_upin=$(printf '%s' "$_jline2" | sed -n 's/.*"unblock_in": \([0-9]*\).*/\1/p')
+if [ -n "$jq_up" ] && [ "$jq_up" -ge $((NOWU + 595)) ] && [ "$jq_up" -le $((NOWU + 620)) ]; then
+  ok "json: pending lift exports its epoch (now+10m)"
+else
+  bad "json: unblock_at wrong ($jq_up vs ~$((NOWU + 600)))"
+fi
+if [ -n "$jq_upin" ] && [ "$jq_upin" -le 600 ] \
+   && [ "$(( jq_up - jq_upin - $(date +%s) ))" -ge -3 ] \
+   && [ "$(( jq_up - jq_upin - $(date +%s) ))" -le 3 ]; then
+  ok "json: unblock_in is derived from that epoch at call time"
+else
+  bad "json: unblock_in inconsistent with the epoch ($jq_upin)"
+fi
+
+# Round-trip an id that needs JSON escaping: parse it back and compare, rather
+# than trying to grep a quoted pattern through two levels of shell quoting.
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ids = [b["id"] for b in d["blocked"]]
+assert "https://example.com/a\"b" in ids, ids
+assert "jsonapp" in ids, ids
+assert all(isinstance(b["enforcement"], str) and b["enforcement"] for b in d["blocked"]), d
+' && ok "json: ids round-trip byte-exact (incl. a quote in a URL)" \
+  || bad "json: an id did not survive the round-trip"
+fi
+
+# Purity: force reconcile to lift a block DURING the call — the narration must
+# land on stderr while stdout stays a clean JSON document. Clear the URL block
+# first so the lift empties the list, which also exercises the empty array.
+ab_unblock_now 'https://example.com/a"b' >/dev/null 2>&1
+# Re-arm a lift (the URL unblock above lifted this one too) so the call below has
+# a real lift to perform while we watch where its narration lands.
+"$AB" block jsonapp >/dev/null 2>&1
+"$AB" unblock jsonapp >/dev/null 2>&1
+sed -i 's/|[0-9]*$/|1/' "$HOME/.local/share/appblock/unblock-at.list"
+out3=$("$AB" list --json 2>"$HOME/json.err")
+printf '%s' "$out3" | grep -q 'unblocked' && bad "json: reconcile narration leaked into stdout" \
+  || ok "json: stdout carries no narration"
+grep -q 'cooldown elapsed' "$HOME/json.err" \
+  && ok "json: the lift it performed was narrated on stderr" \
+  || bad "json: the mid-call lift was silently lost"
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$out3" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["count"]==0, d' \
+    && ok "json: still valid JSON after a mid-call lift (empty blocked)" \
+    || bad "json: broke when the block lifted mid-call"
+fi
+
+# A consumer gates on the version it was built against.
+v=$("$AB" --version 2>/dev/null); v=${v##* }
+case "$v" in [0-9]*.[0-9]*) ok "version: prints a version ($v)" ;; *) bad "version flag broken ('$v')" ;; esac
+"$AB" list --json 2>/dev/null | grep -q "\"version\": \"$v\"" \
+  && ok "version: JSON reports the same version as --version" \
+  || bad "version: JSON and --version disagree"
+"$AB" list --nonsense >/dev/null 2>&1; junk=$?
+check "json: an unknown list option is refused" [ "$junk" -ne 0 ]
+rm -f "$HOME/bin/jsonapp" "$HOME/json.err"
 
 section "reverse-DNS desktop id (shim key != launch name)"
 # Regression: an app whose desktop id (org.example.revdnsapp) differs from the
@@ -558,5 +1029,5 @@ ab_unblock_now demoapp >/dev/null 2>&1
 remaining=$(wc -l <"$HOME/.local/share/appblock/blocked.list")
 [ "$remaining" -eq 0 ] && ok "blocked.list empty after unblocks" || bad "blocked.list not empty ($remaining)"
 
-printf '\n================\n%d passed, %d failed\n' "$pass" "$fail"
+printf '\n================\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
