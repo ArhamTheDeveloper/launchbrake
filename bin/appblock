@@ -16,7 +16,7 @@
 
 set -eu
 
-VERSION=0.2.0
+VERSION=0.2.1
 JSON_SCHEMA=1
 
 BASE="$HOME/.local/share/appblock"
@@ -65,6 +65,36 @@ UNBLOCK_AT="$BASE/unblock-at.list"   # <canonical-id>|<epoch-seconds>, pending l
 touch "$UNBLOCK_AT"
 UNBLOCK_WAIT_DEFAULT=600             # 10m default cooldown
 UNBLOCK_WAIT_MIN=60                  # floor: `--after 0s` must not be a back door
+
+# Every CLI invocation may reconcile and therefore mutate state, including
+# seemingly read-only `list` calls. Generated shims can also perform a lazy lift
+# at launch time. Serialize all of those writers with one portable mkdir lock so
+# two launches/polls cannot clobber each other's read-modify-write cycle.
+LOCK_DIR="$BASE/.state.lock"
+acquire_state_lock() {
+  _sl_tries=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    _sl_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || :)
+    if [ -n "$_sl_owner" ] && ! kill -0 "$_sl_owner" 2>/dev/null; then
+      rm -f "$LOCK_DIR/pid" 2>/dev/null || :
+      rmdir "$LOCK_DIR" 2>/dev/null || :
+      continue
+    fi
+    _sl_tries=$(( _sl_tries + 1 ))
+    [ "$_sl_tries" -lt 100 ] || {
+      echo "appblock: state is busy (waited 5 seconds for $LOCK_DIR)" >&2
+      return 1
+    }
+    sleep 0.05
+  done
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+  trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null || :; rmdir "$LOCK_DIR" 2>/dev/null || :' 0
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+acquire_state_lock
 
 # parse_duration_to_epoch <spec> — print absolute epoch for a relative duration
 # (25m, 2h, 1h30m, 90s) or an absolute time (HH:MM, YYYY-MM-DD HH:MM).
@@ -281,16 +311,14 @@ shim_binary_for_key() { _sbk=$(shim_for_key "$1") && printf '%s\n' "${_sbk##*/}"
 # override location — and is also where Chromium PWAs / omarchy web-app
 # install their real entry, which is why user-dir sources get the rename
 # flow below instead of an override (an override would clobber the original).
-ALL_DIRS="/usr/share/applications /usr/local/share/applications \
-/var/lib/flatpak/exports/share/applications \
-\"$HOME/.local/share/flatpak/exports/share/applications\" \
-\"$DESKTOP_DIR\""
-
 # Print the absolute path of the canonical <id>.desktop if it exists.
 find_desktop_file() {
   name=$1
-  eval "set -- $ALL_DIRS"
-  for d in "$@"; do
+  for d in /usr/share/applications \
+           /usr/local/share/applications \
+           /var/lib/flatpak/exports/share/applications \
+           "$HOME/.local/share/flatpak/exports/share/applications" \
+           "$DESKTOP_DIR"; do
     [ -f "$d/$name.desktop" ] && { echo "$d/$name.desktop"; return 0; }
   done
   return 1
@@ -396,6 +424,28 @@ real_for_key() {
 # $2 as the display name used in its messages.
 blockcheck_body() {
   cat <<EOF
+lock_dir="$LOCK_DIR"
+lock_tries=0
+while ! mkdir "\$lock_dir" 2>/dev/null; do
+  lock_owner=\$(cat "\$lock_dir/pid" 2>/dev/null || :)
+  if [ -n "\$lock_owner" ] && ! kill -0 "\$lock_owner" 2>/dev/null; then
+    rm -f "\$lock_dir/pid" 2>/dev/null || :
+    rmdir "\$lock_dir" 2>/dev/null || :
+    continue
+  fi
+  lock_tries=\$((lock_tries + 1))
+  [ "\$lock_tries" -lt 100 ] || { echo "appblock: state is busy" >&2; exit 1; }
+  sleep 0.05
+done
+printf '%s\n' "\$\$" >"\$lock_dir/pid"
+release_lock() {
+  rm -f "\$lock_dir/pid" 2>/dev/null || :
+  rmdir "\$lock_dir" 2>/dev/null || :
+}
+trap 'release_lock' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if grep -qxF '$1' "$STATE" 2>/dev/null; then
   now=\$(date +%s)
   ep=\$(grep -F '$1|' "$UNTIL" 2>/dev/null | tail -n1 | cut -d'|' -f2) || ep=
@@ -408,12 +458,12 @@ if grep -qxF '$1' "$STATE" 2>/dev/null; then
     # NOTE: grep -v exits 1 when it filters out EVERY line, so chaining mv with
     # && would skip the rename exactly when the last block is lifted. Write the
     # filtered file first, then always move it into place.
-    grep -vxF '$1' "$STATE" > "$STATE.tmp" || :
-    mv -f "$STATE.tmp" "$STATE"
-    grep -vF '$1|' "$UNTIL" 2>/dev/null > "$UNTIL.tmp" || :
-    mv -f "$UNTIL.tmp" "$UNTIL"
-    grep -vF '$1|' "$UNBLOCK_AT" 2>/dev/null > "$UNBLOCK_AT.tmp" || :
-    mv -f "$UNBLOCK_AT.tmp" "$UNBLOCK_AT"
+    grep -vxF '$1' "$STATE" > "$STATE.tmp.\$\$" || :
+    mv -f "$STATE.tmp.\$\$" "$STATE"
+    grep -vF '$1|' "$UNTIL" 2>/dev/null > "$UNTIL.tmp.\$\$" || :
+    mv -f "$UNTIL.tmp.\$\$" "$UNTIL"
+    grep -vF '$1|' "$UNBLOCK_AT" 2>/dev/null > "$UNBLOCK_AT.tmp.\$\$" || :
+    mv -f "$UNBLOCK_AT.tmp.\$\$" "$UNBLOCK_AT"
     # This launch IS the lift — no appblock command ran — so the MENU layer must
     # not stay hidden behind it. reconcile() only ever revisits apps that are
     # still in the blocklist and nothing else comes back for this key, so
@@ -435,6 +485,8 @@ if grep -qxF '$1' "$STATE" 2>/dev/null; then
     exit 1
   fi
 fi
+release_lock
+trap - 0 HUP INT TERM
 EOF
 }
 
@@ -991,7 +1043,22 @@ cmd="${1:-}"
 # blocklist it checks). Timed-block deadlines and pending lifts are exported as
 # raw epochs — the authoritative value — alongside the *seconds* remaining, so a
 # widget can run a live countdown without re-implementing our parsing.
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+has_control_chars() {
+  # grep sees newline as a record separator rather than a character, so test it
+  # explicitly; the character class covers tabs, CR, DEL, and the rest.
+  case "$1" in
+    *'
+'*) return 0 ;;
+  esac
+  LC_ALL=C printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'
+}
+json_str() {
+  if has_control_chars "$1"; then
+    echo "appblock: refusing to encode a control character in JSON state" >&2
+    return 1
+  fi
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
 json_num_or_null() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf 'null'; fi; }
 
 list_json() {
@@ -1153,6 +1220,10 @@ case "$cmd" in
     # pending wait); a bare unblock/toggle must never touch one already pending.
     if [ -n "$after_secs" ]; then unblock_mode=extend; else after_secs=$UNBLOCK_WAIT_DEFAULT; unblock_mode=keep; fi
     for app in "$@"; do
+      if has_control_chars "$app"; then
+        echo "  ! app/URL names may not contain control characters" >&2
+        exit 2
+      fi
       if [ "$app" = "appblock" ]; then
         echo "  ! won't block appblock itself"; continue
       fi

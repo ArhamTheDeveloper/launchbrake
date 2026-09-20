@@ -141,6 +141,15 @@ if command -v gtk-launch >/dev/null 2>&1; then
       gtk-launch "$@"
   }
 
+  # Merely having gtk-launch installed is not enough: headless/SSH/CI sessions
+  # may lack a usable GLib launch context. Prove a harmless sandbox entry can
+  # launch before treating behavioral failures below as appblock regressions.
+  printf '#!/bin/sh\necho GTK-LAUNCH-PROBE\n' >"$HOME/bin/appblock-gtk-probe"
+  chmod +x "$HOME/bin/appblock-gtk-probe"
+  printf '[Desktop Entry]\nType=Application\nName=appblock gtk probe\nExec=%s/bin/appblock-gtk-probe\n' "$HOME" \
+    >"$HOME/.local/share/flatpak/exports/share/applications/appblock-gtk-probe.desktop"
+  if [ "$(GLAUNCH appblock-gtk-probe.desktop 2>/dev/null)" = "GTK-LAUNCH-PROBE" ]; then
+
   # same-name fixture (id == binary): the shape that used to work only by luck
   check "same-name override Exec is the absolute deny path (never the raw id)" \
     grep -qF "Exec=$HOME/.local/share/appblock/shims/.appblock-deny.demoapp" \
@@ -231,6 +240,9 @@ if command -v gtk-launch >/dev/null 2>&1; then
     && ok "same-name by-id click runs after unblock (harness verified)" \
     || bad "same-name by-id click did not run after unblock"
   "$AB" block demoapp >/dev/null 2>&1   # next section expects demoapp blocked
+  else
+    skip "gtk-launch exists but cannot launch a sandbox entry in this session"
+  fi
 else
   skip "gtk-launch not installed — by-id click-through regression not exercised (install gtk3: omarchy ships it)"
 fi
@@ -824,6 +836,11 @@ check "args: ...it is stored literally instead" grep -qxF \
 "$AB" block 'https://z.example/a"b' >/dev/null 2>&1
 check "args: a quote in an argument is stored byte-exact" grep -qxF \
   'https://z.example/a"b' "$HOME/.local/share/appblock/blocked.list"
+check_not "args: a literal tab is rejected before reaching state" \
+  "$AB" block "https://control.example/a$(printf '\t')b"
+check_not "args: a literal newline is rejected before reaching state" \
+  "$AB" block "https://control.example/a
+b"
 # Flags keep working on either side of the app names.
 "$AB" block fricapp --until 17m >/dev/null 2>&1
 check "args: a flag AFTER the app name is parsed" grep -qxF fricapp \

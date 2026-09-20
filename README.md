@@ -64,6 +64,11 @@ app menus, autostart, omarchy web-app keybinds, and desktop icons.
 5. **State** — plaintext files (`blocked.list`, `managed.list`,
    `blocked-until.list`), read fresh each run. Toggling is instant. Real
    binaries and packages are untouched, so the tool survives system updates.
+   CLI reconciliation and launch-time lazy lifts share a cross-process lock,
+   so simultaneous bar polls, commands, and app launches cannot lose each
+   other's state updates. App names and URLs containing control characters are
+   rejected before storage, keeping both the line-oriented files and JSON API
+   well formed.
    The canonical id is the key everywhere (`blocked.list`, the timed-block
    deadline, and the shim's check); the layers that are inherently keyed on
    the launch binary (the shim file itself, autostart `Exec=`, desktop icons)
@@ -114,7 +119,7 @@ appblock list --json | jq -r '.blocked[] | "\(.id) \(.unblock_in // "-")"'
 ```json
 {
   "schema": 1,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "state_dir": "/home/you/.local/share/appblock",
   "count": 1,
   "blocked": [
