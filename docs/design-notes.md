@@ -1,4 +1,4 @@
-# appblock — project brief
+# appblock — design notes
 
 ## What it is
 `appblock` is a tiny, dependency-free CLI tool for Linux that lets you **block any installed app — GUI, CLI, or web-app/PWA — from launching, with an instant toggle to unblock it**. It exists to fight distraction (music players, games, social apps) without uninstalling or breaking anything.
