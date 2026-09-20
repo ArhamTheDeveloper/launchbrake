@@ -1,6 +1,6 @@
 # Compatibility
 
-appblock targets Linux and XDG-compatible desktop environments. It is tested
+LaunchBrake targets Linux and XDG-compatible desktop environments. It is tested
 primarily on Omarchy with Hyprland; it is not intended for macOS, BSD, or
 generic Unix systems.
 
@@ -26,7 +26,7 @@ generic Unix systems.
 | Wine app | Matching desktop entry/icon; blocking `wine` blocks all Wine launches | Direct or differently named Wine command |
 | Steam game | Matching desktop entry where present | Direct Steam protocol/library launch |
 
-Linux has no universal application-launch interception point. appblock covers
+Linux has no universal application-launch interception point. LaunchBrake covers
 normal launch routes it can discover and reports the enforcement it currently
 has. It deliberately remains a friction tool rather than an access-control
 system.

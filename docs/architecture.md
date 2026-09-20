@@ -1,6 +1,6 @@
 # Architecture
 
-appblock applies one canonical blocked ID across several independent Linux
+LaunchBrake applies one canonical blocked ID across several independent Linux
 launch surfaces:
 
 1. PATH shims intercept ordinary command launches.
@@ -15,8 +15,8 @@ launch guards share `.state.lock`, preventing concurrent processes from losing
 updates. No daemon is required: timed expiry and unblock cooldowns are applied
 lazily on launch or the next appblock invocation.
 
-The optional Omarchy plugin is a separate consumer. Its only state API is
-`appblock list --json`; the CLI never depends on the plugin.
+The optional LaunchBrake Omarchy plugin is a separate consumer. Its only state
+API is `appblock list --json`; the CLI never depends on the plugin.
 
 For implementation history and resolved edge cases, see
 [design-notes.md](design-notes.md).

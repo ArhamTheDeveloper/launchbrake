@@ -3,6 +3,11 @@
 All notable changes are documented here. The project follows semantic
 versioning.
 
+## Unreleased
+
+- Renamed the public project to LaunchBrake while retaining `appblock` as the
+  stable CLI command and state namespace.
+
 ## 0.3.0
 
 - Added `appblock uninstall`, including immediate restoration of appblock-owned

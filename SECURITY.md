@@ -1,6 +1,6 @@
 # Security policy
 
-appblock is a self-control and friction tool, not a security boundary. A user
+LaunchBrake is a self-control and friction tool, not a security boundary. A user
 who can edit their own files can remove its shims, edit its plaintext state, run
 an executable by absolute path, or use an uncovered runtime-specific launcher.
 Those intentional escape hatches are not security vulnerabilities.

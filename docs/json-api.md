@@ -27,9 +27,9 @@ messages go to stderr.
   schemas rather than guessing.
 - `version` is the appblock release version.
 - `count` equals the number of entries in `blocked`.
-- `enforcement` is appblock's current human-readable verdict and is not an enum.
+- `enforcement` is the CLI's current human-readable verdict and is not an enum.
 - `until` and `unblock_at` are authoritative Unix epochs or `null`.
 - `until_in` and `unblock_in` are snapshots of remaining seconds.
 - `managed` contains launch command names with installed PATH shims.
 
-Consumers must use this API instead of reading appblock's internal state files.
+Consumers must use this API instead of reading LaunchBrake's internal state files.

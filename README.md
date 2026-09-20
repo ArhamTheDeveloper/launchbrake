@@ -1,8 +1,11 @@
-# appblock
+# LaunchBrake
 
-Block distracting Linux applications without uninstalling them. appblock is a
+Block distracting Linux applications without uninstalling them. LaunchBrake is a
 lightweight friction tool for normal command, launcher, autostart, desktop-icon,
 and Omarchy web-app launch routes.
+
+The project is named **LaunchBrake**; its stable command remains `appblock`, and
+its state remains under `~/.local/share/appblock/`.
 
 It is built and tested primarily on Omarchy with Hyprland, while its core uses
 Linux PATH and XDG conventions that apply across desktop environments. It is not
@@ -43,8 +46,8 @@ desktop, and runtime details.
 ## Installation
 
 ```sh
-git clone https://github.com/ArhamTheDeveloper/appblock.git
-cd appblock
+git clone https://github.com/ArhamTheDeveloper/launchbrake.git
+cd launchbrake
 install -Dm755 bin/appblock ~/.local/share/appblock/appblock
 ~/.local/share/appblock/appblock install
 ```
@@ -95,7 +98,7 @@ Durations accept forms such as `45s`, `25m`, `2h`, `1h30m`, `22:30`, or
 
 ## What blocking covers
 
-appblock combines several independent mechanisms:
+LaunchBrake combines several independent mechanisms:
 
 - PATH shims for ordinary command launches;
 - XDG desktop overrides for menus and by-ID launcher calls;
@@ -138,7 +141,7 @@ stdout contains exactly one schema-versioned JSON document; reconciliation
 messages go to stderr. Consumers must use this API rather than reading internal
 state files. See the [JSON API contract](docs/json-api.md).
 
-The optional [Omarchy bar plugin](https://github.com/ArhamTheDeveloper/omarchy-appblock)
+The optional [LaunchBrake Omarchy plugin](https://github.com/ArhamTheDeveloper/omarchy-launchbrake)
 is a separate repository and consumes only this API.
 
 ## Uninstall
