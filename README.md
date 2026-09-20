@@ -73,6 +73,7 @@ appblock toggle <app|url>... [--until <duration>]
 appblock list [--json]
 appblock shims
 appblock install
+appblock uninstall
 appblock --version
 ```
 
@@ -142,14 +143,14 @@ is a separate repository and consumes only this API.
 
 ## Uninstall
 
-There is not yet an automated uninstall command. Before removing appblock,
-unblock targets and let any pending cleanup reconcile:
+Run:
 
 ```sh
-appblock list
+appblock uninstall
 ```
 
-Then remove these appblock-owned items:
+Uninstall is an explicit whole-tool removal, so it restores blocked targets
+immediately rather than scheduling an unblock cooldown. It then removes:
 
 - `~/.local/share/appblock/`
 - `~/.config/environment.d/appblock.conf`
@@ -158,9 +159,10 @@ Then remove these appblock-owned items:
 - the `-- appblock shims on PATH (added by appblock)` marker and following
   `hl.env(...)` line from `~/.config/hypr/hyprland.lua`, if present
 
-Log out and back in afterward. Do not remove `.desktop` files manually while
-targets remain blocked; unblock them first so appblock can restore its reversible
-overrides.
+It also republishes the live systemd-user PATH without the shim directory. Log
+out and back in afterward so every existing desktop process receives the clean
+environment. Installed applications and unrelated desktop entries are never
+removed.
 
 ## Development
 

@@ -6,7 +6,7 @@ messages go to stderr.
 ```json
 {
   "schema": 1,
-  "version": "0.2.1",
+  "version": "0.3.0",
   "state_dir": "/home/you/.local/share/appblock",
   "count": 1,
   "blocked": [

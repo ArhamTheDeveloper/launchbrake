@@ -16,7 +16,7 @@
 
 set -eu
 
-VERSION=0.2.1
+VERSION=0.3.0
 JSON_SCHEMA=1
 
 BASE="$HOME/.local/share/appblock"
@@ -1010,13 +1010,114 @@ install_env() {
   echo "   now inherit PATH from the live manager (already updated)."
 }
 
+# Remove one directory from a colon-separated PATH without evaluating it.
+path_without() {
+  _pw_drop=$1; _pw_path=$2; _pw_out=
+  _pw_ifs=$IFS; IFS=:
+  set -f
+  for _pw_dir in $_pw_path; do
+    [ "$_pw_dir" = "$_pw_drop" ] && continue
+    if [ -n "$_pw_out" ]; then _pw_out="$_pw_out:$_pw_dir"; else _pw_out=$_pw_dir; fi
+  done
+  set +f; IFS=$_pw_ifs
+  printf '%s\n' "$_pw_out"
+}
+
+remove_installed_pair() {
+  _rip_file=$1; _rip_marker=$2; _rip_owned=$3
+  [ -f "$_rip_file" ] || return 0
+  _rip_tmp="$_rip_file.appblock-uninstall.$$"
+  awk -v marker="$_rip_marker" -v owned="$_rip_owned" '
+    pending {
+      pending=0
+      if ($0 == owned) next
+    }
+    $0 == marker { pending=1; next }
+    { print }
+  ' "$_rip_file" >"$_rip_tmp"
+  mv -f "$_rip_tmp" "$_rip_file"
+}
+
+uninstall_appblock() {
+  [ "$BASE" = "$HOME/.local/share/appblock" ] || {
+    echo "appblock: refusing unexpected uninstall path: $BASE" >&2
+    return 1
+  }
+
+  # Uninstall is an explicit whole-tool removal, so restore immediately rather
+  # than scheduling one cooldown per target. Only artifacts carrying appblock's
+  # own names/markers are touched.
+  # First repair artifacts whose keys were manually removed from blocked.list.
+  cleanup_stale
+
+  if [ -s "$STATE" ]; then
+    while IFS= read -r _ua_id; do
+      [ -n "$_ua_id" ] || continue
+      _ua_bin=$(shim_binary_for_key "$_ua_id" || :); _ua_bin=${_ua_bin:-$_ua_id}
+      unhide_desktop "$_ua_id"
+      restore_autostart "$_ua_bin"
+      restore_desktop_icons "$_ua_id"
+    done <"$STATE"
+  fi
+
+  # Backups/icons are appblock-owned by location/name. Sweep them as a final
+  # recovery path even if the other state files were edited or damaged.
+  if [ -d "$BACKUP_DIR" ]; then
+    for _ua_backup in "$BACKUP_DIR"/*.desktop; do
+      [ -f "$_ua_backup" ] || continue
+      _ua_live="$AUTOSTART_DIR/$(basename "$_ua_backup")"
+      [ -f "$_ua_live" ] || continue
+      _ua_hidden=$(sed -n 's/^Hidden=//p' "$_ua_backup" | head -n1)
+      sed -i '/^Hidden=/d' "$_ua_live"
+      [ -n "$_ua_hidden" ] && printf 'Hidden=%s\n' "$_ua_hidden" >>"$_ua_live"
+    done
+  fi
+  if [ -n "$ICON_DIR" ] && [ -d "$ICON_DIR" ]; then
+    for _ua_icon in "$ICON_DIR"/.appblock-disabled.*.desktop.off; do
+      [ -f "$_ua_icon" ] || continue
+      _ua_name=$(basename "$_ua_icon"); _ua_name=${_ua_name#.appblock-disabled.}; _ua_name=${_ua_name%.off}
+      if [ -e "$ICON_DIR/$_ua_name" ]; then
+        echo "  ! kept $_ua_icon because $ICON_DIR/$_ua_name already exists" >&2
+      else
+        mv -f "$_ua_icon" "$ICON_DIR/$_ua_name"
+      fi
+    done
+  fi
+
+  _ua_shell_line='export PATH="$HOME/.local/share/appblock/shims:$PATH"'
+  _ua_hypr_line="hl.env(\"PATH\", \"$SHIMS:\" .. (os.getenv(\"PATH\") or \"\"))"
+  remove_installed_pair "$HOME/.bashrc" '# appblock shims (added by appblock)' "$_ua_shell_line"
+  remove_installed_pair "$HOME/.zshrc" '# appblock shims (added by appblock)' "$_ua_shell_line"
+  remove_installed_pair "$HOME/.config/hypr/hyprland.lua" '-- appblock shims on PATH (added by appblock)' "$_ua_hypr_line"
+
+  _ua_env="$HOME/.config/environment.d/appblock.conf"
+  if [ -f "$_ua_env" ] && grep -qF '# appblock shims (added by appblock)' "$_ua_env"; then
+    rm -f "$_ua_env"
+  fi
+
+  # Do not unset PATH wholesale in the user manager. Re-publish the current
+  # shell PATH with only appblock's shim component removed.
+  if command -v systemctl >/dev/null 2>&1; then
+    _ua_path=$(path_without "$SHIMS" "$PATH")
+    sdq set-environment PATH="$_ua_path" >/dev/null 2>&1 || :
+  fi
+
+  # BASE is exact-guarded above. Removing it also removes shims, pending timers,
+  # backups, the lock, and an installed copy of this script; the running shell
+  # has already parsed the program and can finish safely.
+  rm -rf "$BASE"
+  trap - 0 HUP INT TERM
+  echo "✔ appblock uninstalled"
+  echo "ℹ️  log out and back in to remove it from every desktop process environment"
+}
+
 usage_main() {
   cat <<'USAGE'
 usage: appblock block <app|url>... [--until <dur>] [--keep-running]
        appblock unblock <app|url>... [--after <dur>|--cancel]
        appblock toggle <app|url>...
        appblock list [--json]                 # --json: stable machine-readable state
-       appblock shims | install | --version
+       appblock shims | install | uninstall | --version
   --until 25m       block only until then, then lift by itself (25m, 2h, 1h30m, 22:30)
   --after 30m       wait longer before a requested unblock lifts (default 10m)
   --keep-running    blocking an applet that is already up stops it, and its
@@ -1353,6 +1454,9 @@ case "$cmd" in
            install_shim "$a" || echo "  ! could not (re)install shim for '$a' (binary not on PATH?)" >&2
          done <"$MANAGED"; refresh_webguard; echo "shims refreshed" ;;
   install) install_env ;;
+  uninstall)
+    [ $# -eq 0 ] || { echo "usage: appblock uninstall" >&2; exit 2; }
+    uninstall_appblock ;;
   --version|-v) echo "appblock $VERSION" ;;
   --help|-h|help) usage_main ;;
   *) usage_main; exit 2 ;;

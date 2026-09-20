@@ -3,6 +3,13 @@
 All notable changes are documented here. The project follows semantic
 versioning.
 
+## 0.3.0
+
+- Added `appblock uninstall`, including immediate restoration of appblock-owned
+  launcher, desktop-icon, and autostart changes.
+- Removed only marked shell, environment.d, and Hyprland PATH integration during
+  uninstall, and safely republish the live systemd-user PATH without the shim.
+
 ## 0.2.1
 
 - Serialized CLI reconciliation and launch-time lazy lifts with a shared lock.

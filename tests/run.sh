@@ -1042,9 +1042,40 @@ ab_unblock_now revdnsapp >/dev/null 2>&1
   && bad "empty blocklist emits an integer error" || ok "empty blocklist lists cleanly"
 
 section "uninstall-cleanliness"
-ab_unblock_now demoapp >/dev/null 2>&1
-remaining=$(wc -l <"$HOME/.local/share/appblock/blocked.list")
-[ "$remaining" -eq 0 ] && ok "blocked.list empty after unblocks" || bad "blocked.list not empty ($remaining)"
+# Exercise uninstall while an app is actively blocked: whole-tool removal must
+# restore appblock-owned layers immediately, without waiting through the normal
+# per-app cooldown.
+mkdir -p "$HOME/.config/hypr"
+printf 'return {}\n' >"$HOME/.config/hypr/hyprland.lua"
+"$AB" install >/dev/null 2>&1
+# If a user edits the installed line but leaves the marker, uninstall removes
+# the marker only; it must not assume the following line is still ours.
+sed -i 's#^export PATH="$HOME/.local/share/appblock/shims:$PATH"$#user-owned-after-marker#' "$HOME/.zshrc"
+"$AB" block demoapp >/dev/null 2>&1
+check "uninstall fixture has a menu override" test -f \
+  "$HOME/.local/share/applications/demoapp.desktop"
+check "uninstall fixture has disabled autostart" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/demoapp.desktop"
+check_not "uninstall rejects unexpected arguments" "$AB" uninstall --force
+"$AB" uninstall >/dev/null 2>&1
+check_not "uninstall removed appblock state and shims" test -e \
+  "$HOME/.local/share/appblock"
+check_not "uninstall removed the menu override" test -e \
+  "$HOME/.local/share/applications/demoapp.desktop"
+check_not "uninstall re-enabled autostart" grep -q '^Hidden=true' \
+  "$HOME/.config/autostart/demoapp.desktop"
+check_not "uninstall removed bash PATH marker" grep -qF \
+  '# appblock shims (added by appblock)' "$HOME/.bashrc"
+check_not "uninstall removed zsh PATH marker" grep -qF \
+  '# appblock shims (added by appblock)' "$HOME/.zshrc"
+check "uninstall preserved a user-edited line after the zsh marker" grep -qF \
+  'user-owned-after-marker' "$HOME/.zshrc"
+check_not "uninstall removed environment.d file" test -e \
+  "$HOME/.config/environment.d/appblock.conf"
+check_not "uninstall removed Hyprland PATH marker" grep -qF -- \
+  '-- appblock shims on PATH (added by appblock)' "$HOME/.config/hypr/hyprland.lua"
+check "uninstall preserved unrelated Hyprland config" grep -q '^return {}$' \
+  "$HOME/.config/hypr/hyprland.lua"
 
 printf '\n================\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
