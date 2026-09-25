@@ -22,7 +22,7 @@ generic Unix systems.
 | Flatpak | XDG desktop entry | Direct `flatpak run <id>` |
 | Snap | `/snap/bin` command through PATH, plus desktop entry | Direct `/snap/bin/<app>` |
 | AppImage | PATH command or registered desktop entry | Direct execution of the AppImage file |
-| Web app/PWA | Desktop entry; Omarchy URLs also use the web-app guard | Typing the URL in a browser |
+| Web app/PWA | Registered desktop entry; Omarchy's web-app launcher can also be intercepted | Normal browser navigation is not blocked |
 | Wine app | Matching desktop entry/icon; blocking `wine` blocks all Wine launches | Direct or differently named Wine command |
 | Steam game | Matching desktop entry where present | Direct Steam protocol/library launch |
 
@@ -30,6 +30,9 @@ Linux has no universal application-launch interception point. LaunchBrake covers
 normal launch routes it can discover and reports the enforcement it currently
 has. It deliberately remains a friction tool rather than an access-control
 system.
+
+LaunchBrake is not a DNS, proxy, browser-extension, or network filter. It does
+not provide general website blocking.
 
 ## Runtime requirements
 

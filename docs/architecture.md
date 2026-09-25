@@ -8,7 +8,9 @@ launch surfaces:
 3. XDG autostart entries receive `Hidden=true`; systemd user units may be
    stopped when an applet is already running.
 4. Matching desktop-icon files are renamed aside and restored byte-for-byte.
-5. Omarchy web-app URLs are guarded through `omarchy-launch-webapp` on PATH.
+5. Registered Omarchy web-app launches can be guarded through
+   `omarchy-launch-webapp` on PATH. This does not intercept normal browser
+   navigation.
 
 State lives under `~/.local/share/appblock/`. CLI reconciliation and generated
 launch guards share `.state.lock`, preventing concurrent processes from losing

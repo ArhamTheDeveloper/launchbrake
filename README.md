@@ -2,7 +2,7 @@
 
 Block distracting Linux applications without uninstalling them. LaunchBrake is a
 lightweight friction tool for normal command, launcher, autostart, desktop-icon,
-and Omarchy web-app launch routes.
+and registered Omarchy web-app launch routes.
 
 The project is named **LaunchBrake**; its stable command remains `appblock`, and
 its state remains under `~/.local/share/appblock/`.
@@ -69,10 +69,14 @@ $HOME/.local/share/appblock/shims
 
 ## Usage
 
+LaunchBrake is **not a website blocker**. It does not filter browser traffic and
+cannot stop a URL typed into a browser. Block a browser or a registered web-app
+launcher when that is the behavior you want.
+
 ```text
-appblock block <app|url>... [--until <duration>] [--keep-running]
-appblock unblock <app|url>... [--after <duration>|--cancel]
-appblock toggle <app|url>... [--until <duration>]
+appblock block <app>... [--until <duration>] [--keep-running]
+appblock unblock <app>... [--after <duration>|--cancel]
+appblock toggle <app>... [--until <duration>]
 appblock list [--json]
 appblock shims
 appblock install
@@ -86,7 +90,6 @@ Examples:
 appblock block discord spotify
 appblock block steam --until 90m
 appblock block youtube --until 22:30
-appblock block https://youtube.com/
 
 appblock unblock discord
 appblock unblock discord --after 30m
@@ -104,7 +107,12 @@ LaunchBrake combines several independent mechanisms:
 - XDG desktop overrides for menus and by-ID launcher calls;
 - reversible hiding of user-owned PWA and desktop-icon files;
 - XDG autostart disabling, with optional systemd-user stopping of a running applet;
-- an Omarchy `omarchy-launch-webapp` URL guard when applicable.
+- registered Omarchy web-app launcher interception when applicable.
+
+The Omarchy integration can refuse a URL passed specifically through
+`omarchy-launch-webapp`; this is launcher interception, not general website
+blocking. Normal browser tabs and address-bar navigation are outside the tool's
+scope.
 
 The canonical desktop ID is used consistently across these layers. Every CLI
 invocation reconciles drift caused by app updates. Concurrent CLI calls, bar
