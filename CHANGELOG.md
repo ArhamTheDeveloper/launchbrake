@@ -5,6 +5,9 @@ versioning.
 
 ## Unreleased
 
+- Reworked installation documentation into requirements, download, setup,
+  login-session activation, verification, first-use, and update steps.
+
 ## 0.3.1 - 2026-09-25
 
 - Renamed the public project to LaunchBrake while retaining `appblock` as the

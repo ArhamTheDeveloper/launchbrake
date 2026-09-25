@@ -12,20 +12,55 @@ Linux PATH and XDG conventions that apply across desktop environments. It is not
 an access-control or security boundary: direct executable paths and uncovered
 runtime-specific launchers remain intentional escape hatches.
 
-## Quick start
+## Installation
+
+### Requirements
+
+LaunchBrake supports Linux and requires a POSIX-compatible `/bin/sh` plus GNU
+core utilities. It is tested primarily on Arch Linux and Omarchy. Installation
+is per-user and does not require `sudo`.
+
+### 1. Download LaunchBrake
+
+```sh
+git clone https://github.com/ArhamTheDeveloper/launchbrake.git
+cd launchbrake
+```
+
+### 2. Install the CLI
 
 ```sh
 install -Dm755 bin/appblock ~/.local/share/appblock/appblock
 ~/.local/share/appblock/appblock install
-
-appblock block discord
-appblock block steam --until 2h
-appblock list
-appblock unblock discord            # schedules the normal 10-minute cooldown
 ```
 
-Start a new login session after installation so every desktop launch path sees
-the shim directory.
+**LaunchBrake** is the project name; its stable terminal command is `appblock`.
+
+### 3. Log out and back in
+
+Log out of your desktop session and log back in once. This allows new
+terminals, application launchers, desktop menus, and user services to see
+LaunchBrake's shim directory.
+
+### 4. Verify the installation
+
+```sh
+appblock --version
+appblock list
+```
+
+The first command should print the installed version. The second should show an
+empty blocked-app list on a new installation.
+
+### 5. Block an application
+
+```sh
+appblock block discord
+appblock list
+
+appblock block steam --until 2h
+appblock unblock discord            # schedules the normal 10-minute cooldown
+```
 
 ## Support at a glance
 
@@ -43,14 +78,7 @@ the shim directory.
 See [the complete compatibility matrix](docs/compatibility.md) for package,
 desktop, and runtime details.
 
-## Installation
-
-```sh
-git clone https://github.com/ArhamTheDeveloper/launchbrake.git
-cd launchbrake
-install -Dm755 bin/appblock ~/.local/share/appblock/appblock
-~/.local/share/appblock/appblock install
-```
+## What installation changes
 
 `appblock install` is idempotent. It creates or updates:
 
@@ -61,11 +89,30 @@ install -Dm755 bin/appblock ~/.local/share/appblock/appblock
 - the live systemd user-manager PATH, when systemd is available.
 
 On a non-Hyprland desktop, the Hyprland step is simply skipped. If your session
-does not import `environment.d`, add this directory to its PATH manually:
+does not import `environment.d`, add the shim directory to the session's PATH.
+For the current terminal, run:
 
 ```sh
-$HOME/.local/share/appblock/shims
+export PATH="$HOME/.local/share/appblock/shims:$PATH"
 ```
+
+Add the same export to your shell profile or desktop session environment to
+make it persistent.
+
+## Updating
+
+From the cloned LaunchBrake repository, run:
+
+```sh
+git pull --ff-only
+install -Dm755 bin/appblock ~/.local/share/appblock/appblock
+~/.local/share/appblock/appblock install
+appblock shims
+```
+
+The final command refreshes generated application shims with the updated
+LaunchBrake logic. Log out and back in if the installer reports a session PATH
+change.
 
 ## Usage
 
