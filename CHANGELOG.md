@@ -9,6 +9,7 @@ versioning.
   stable CLI command and state namespace.
 - Clarified that Omarchy web-app launcher interception is not general website
   blocking, and removed the misleading standalone URL example from the README.
+- Added a transparent AI-assisted development disclosure.
 
 ## 0.3.0
 

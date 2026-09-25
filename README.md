@@ -197,6 +197,12 @@ docs/design-notes.md     detailed engineering history
 See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
 [CHANGELOG.md](CHANGELOG.md).
 
+## Development disclosure
+
+LaunchBrake was conceived, specified, tested, and maintained by Muhammad Arham.
+Its implementation was produced with substantial assistance from AI coding
+tools under human direction and review.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
