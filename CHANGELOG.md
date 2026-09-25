@@ -5,6 +5,8 @@ versioning.
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-25
+
 - Renamed the public project to LaunchBrake while retaining `appblock` as the
   stable CLI command and state namespace.
 - Clarified that Omarchy web-app launcher interception is not general website

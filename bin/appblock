@@ -16,7 +16,7 @@
 
 set -eu
 
-VERSION=0.3.0
+VERSION=0.3.1
 JSON_SCHEMA=1
 
 BASE="$HOME/.local/share/appblock"
